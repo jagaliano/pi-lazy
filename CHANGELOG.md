@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Fix jiti resolution: prefer `createJiti` over the CJS default function wrapper
+- Sync `j(path)` broke top-level await in lazy-loaded TS extensions (`rpiv-todo`, `rpiv-ask-user-question`)
+- Pass `moduleCache: false` like pi-core when importing extension modules
+
 ## 0.1.0
 
 - Initial release: LazyVim-style extension manager for Pi Coding Agent

@@ -1,6 +1,6 @@
 {
   "name": "@rahularya01/pi-lazy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "LazyVim-style extension manager for Pi Coding Agent — load packages after start or on demand (cmd/tools/keywords).",
   "author": "Rahul Arya",
   "license": "MIT",
@@ -39,6 +39,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test:integration": "node scripts/integration-load.mjs",
+    "test:smoke": "node scripts/smoke-pi.mjs",
+    "test": "npm run typecheck && npm run test:integration",
     "prepublishOnly": "npm run typecheck"
   },
   "pi": {

@@ -115,16 +115,21 @@ function resolveJitiCreate(): ((...args: any[]) => any) | null {
 	for (const jitiPath of [...new Set(candidates)]) {
 		try {
 			const require = createRequire(jitiPath);
-			const jitiMod = require(jitiPath) as { createJiti?: (...args: any[]) => any } | ((...args: any[]) => any);
-			if (typeof jitiMod === "function") {
-				return (filename: string, opts: object) => {
-					const j = (jitiMod as Function)(filename, opts);
-					return {
-						import: async (path: string, _opts?: object) => j(path),
-					};
-				};
+			const jitiMod = require(jitiPath) as {
+				createJiti?: (...args: any[]) => any;
+			} & ((...args: any[]) => any);
+
+			// jiti v2 CJS: default export is createJiti itself AND has .createJiti.
+			// Prefer the real createJiti API (returns instance with async .import).
+			// Never wrap with sync j(path) — that rewrites ESM/TS to CJS and breaks
+			// top-level await (e.g. rpiv-todo / rpiv-ask-user-question).
+			if (typeof jitiMod?.createJiti === "function") {
+				return jitiMod.createJiti.bind(jitiMod);
 			}
-			if (jitiMod?.createJiti) return jitiMod.createJiti.bind(jitiMod);
+			if (typeof jitiMod === "function") {
+				// Already createJiti (or a compatible factory).
+				return jitiMod;
+			}
 		} catch {
 			/* try next */
 		}
@@ -153,22 +158,30 @@ async function importFactory(extensionPath: string): Promise<((api: ExtensionAPI
 		const aliases = await buildAliases();
 		const jiti = createJiti(import.meta.url, {
 			interopDefault: true,
+			// Match pi-core: avoid stale transformed modules across reloads.
+			moduleCache: false,
 			alias: aliases,
 		});
-		// jiti v2
-		if (typeof jiti.import === "function") {
+		// jiti v2 instance exposes async .import (handles top-level await).
+		if (jiti && typeof jiti.import === "function") {
 			try {
 				const mod = await jiti.import(extensionPath, { default: true });
 				const factory = asFactory(mod);
 				if (factory) return factory;
-			} catch {
-				/* try namespace import */
+			} catch (firstErr) {
+				// Retry namespace import only when default unwrap looked wrong,
+				// not when the module itself failed to evaluate.
+				const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+				if (/does not provide an export named|default/i.test(msg)) {
+					const mod = await jiti.import(extensionPath);
+					return asFactory(mod);
+				}
+				throw firstErr;
 			}
 			const mod = await jiti.import(extensionPath);
 			return asFactory(mod);
 		}
-		// unexpected shape
-		return asFactory(jiti(extensionPath));
+		throw new Error("jiti instance missing async import()");
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to import extension module ${extensionPath}: ${message}`);
