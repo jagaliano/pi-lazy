@@ -35,20 +35,10 @@ let jitiInstance: any | undefined;
 function resolvePiPackageJson(): string | null {
 	if (cachedPiPackageJson !== undefined) return cachedPiPackageJson;
 	const finish = (value: string | null) => (cachedPiPackageJson = value);
-	try {
-		const url = import.meta.resolve("@earendil-works/pi-coding-agent/package.json");
-		return finish(fileURLToPath(url));
-	} catch {
-		/* fall through */
-	}
-	try {
-		const require = createRequire(import.meta.url);
-		return finish(require.resolve("@earendil-works/pi-coding-agent/package.json"));
-	} catch {
-		/* fall through */
-	}
 
-	// Walk from the running pi binary / entry script
+	// Prefer the package that is executing Pi, not pi-lazy's own installed copy.
+	// The latter can be an older version and its private dependency tree is not
+	// necessarily compatible with the live host runtime.
 	try {
 		const bin = realpathSync(process.argv[1] ?? "");
 		let dir = dirname(bin);
@@ -70,6 +60,19 @@ function resolvePiPackageJson(): string | null {
 		}
 	} catch {
 		/* ignore */
+	}
+
+	try {
+		const url = import.meta.resolve("@earendil-works/pi-coding-agent/package.json");
+		return finish(fileURLToPath(url));
+	} catch {
+		/* fall through */
+	}
+	try {
+		const require = createRequire(import.meta.url);
+		return finish(require.resolve("@earendil-works/pi-coding-agent/package.json"));
+	} catch {
+		/* fall through */
 	}
 
 	// Common global npm layouts
@@ -217,8 +220,14 @@ async function buildAliases(): Promise<Record<string, string>> {
 	const aliases: Record<string, string> = {};
 	const piPkg = resolvePiPackageJson();
 	const piRoot = piPkg ? dirname(piPkg) : null;
-	const nm = piRoot ? join(piRoot, "node_modules") : null;
+	// npm can nest Pi's dependencies or hoist them beside the scoped package.
+	// Check both layouts; global Bun/npm installs use the latter.
+	const piModuleRoots = piRoot
+		? [join(piRoot, "node_modules"), dirname(dirname(piRoot))]
+		: [];
 	const requireFromPi = piPkg ? createRequire(piPkg) : null;
+	const piModule = (pkg: string, file: string) =>
+		firstExisting(...piModuleRoots.map((root) => join(root, pkg, file)));
 
 	const set = (spec: string, path: string | null | undefined) => {
 		if (path) aliases[spec] = path;
@@ -251,29 +260,29 @@ async function buildAliases(): Promise<Record<string, string>> {
 
 	const agentCore = firstExisting(
 		resolveSpec("@earendil-works/pi-agent-core"),
-		nm ? join(nm, "@earendil-works/pi-agent-core/dist/index.js") : null,
+		piModule("@earendil-works/pi-agent-core", "dist/index.js"),
 	);
 	set("@earendil-works/pi-agent-core", agentCore);
 	set("@mariozechner/pi-agent-core", agentCore);
 
 	const tui = firstExisting(
 		resolveSpec("@earendil-works/pi-tui"),
-		nm ? join(nm, "@earendil-works/pi-tui/dist/index.js") : null,
+		piModule("@earendil-works/pi-tui", "dist/index.js"),
 	);
 	set("@earendil-works/pi-tui", tui);
 	set("@mariozechner/pi-tui", tui);
 
 	const aiCompat = firstExisting(
 		resolveSpec("@earendil-works/pi-ai/compat"),
-		nm ? join(nm, "@earendil-works/pi-ai/dist/compat.js") : null,
+		piModule("@earendil-works/pi-ai", "dist/compat.js"),
 	);
 	const aiOauth = firstExisting(
 		resolveSpec("@earendil-works/pi-ai/oauth"),
-		nm ? join(nm, "@earendil-works/pi-ai/dist/oauth.js") : null,
+		piModule("@earendil-works/pi-ai", "dist/oauth.js"),
 	);
 	const aiProviders = firstExisting(
 		resolveSpec("@earendil-works/pi-ai/providers/all"),
-		nm ? join(nm, "@earendil-works/pi-ai/dist/providers/all.js") : null,
+		piModule("@earendil-works/pi-ai", "dist/providers/all.js"),
 	);
 
 	// IMPORTANT: register longer subpaths before the package root alias
@@ -283,8 +292,12 @@ async function buildAliases(): Promise<Record<string, string>> {
 	set("@mariozechner/pi-ai/oauth", aiOauth);
 	set("@earendil-works/pi-ai/compat", aiCompat);
 	set("@mariozechner/pi-ai/compat", aiCompat);
-	set("@earendil-works/pi-ai", aiCompat);
-	set("@mariozechner/pi-ai", aiCompat);
+	const ai = firstExisting(
+		resolveSpec("@earendil-works/pi-ai"),
+		piModule("@earendil-works/pi-ai", "dist/index.js"),
+	);
+	set("@earendil-works/pi-ai", ai);
+	set("@mariozechner/pi-ai", ai);
 
 	// typebox subpath exports must be exact
 	const typebox = resolveSpec("typebox");

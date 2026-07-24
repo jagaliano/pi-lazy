@@ -190,16 +190,6 @@ function resolvePiPackageJson() {
   if (cachedPiPackageJson !== void 0) return cachedPiPackageJson;
   const finish = (value) => cachedPiPackageJson = value;
   try {
-    const url = import.meta.resolve("@earendil-works/pi-coding-agent/package.json");
-    return finish(fileURLToPath(url));
-  } catch {
-  }
-  try {
-    const require2 = createRequire(import.meta.url);
-    return finish(require2.resolve("@earendil-works/pi-coding-agent/package.json"));
-  } catch {
-  }
-  try {
     const bin = realpathSync(process.argv[1] ?? "");
     let dir = dirname2(bin);
     for (let i = 0; i < 10; i++) {
@@ -217,6 +207,16 @@ function resolvePiPackageJson() {
       if (parent === dir) break;
       dir = parent;
     }
+  } catch {
+  }
+  try {
+    const url = import.meta.resolve("@earendil-works/pi-coding-agent/package.json");
+    return finish(fileURLToPath(url));
+  } catch {
+  }
+  try {
+    const require2 = createRequire(import.meta.url);
+    return finish(require2.resolve("@earendil-works/pi-coding-agent/package.json"));
   } catch {
   }
   for (const guess of [
@@ -336,8 +336,9 @@ async function buildAliases() {
   const aliases = {};
   const piPkg = resolvePiPackageJson();
   const piRoot = piPkg ? dirname2(piPkg) : null;
-  const nm = piRoot ? join2(piRoot, "node_modules") : null;
+  const piModuleRoots = piRoot ? [join2(piRoot, "node_modules"), dirname2(dirname2(piRoot))] : [];
   const requireFromPi = piPkg ? createRequire(piPkg) : null;
+  const piModule = (pkg, file) => firstExisting(...piModuleRoots.map((root) => join2(root, pkg, file)));
   const set = (spec, path) => {
     if (path) aliases[spec] = path;
   };
@@ -363,27 +364,27 @@ async function buildAliases() {
   set("@mariozechner/pi-coding-agent", piCoding);
   const agentCore = firstExisting(
     resolveSpec("@earendil-works/pi-agent-core"),
-    nm ? join2(nm, "@earendil-works/pi-agent-core/dist/index.js") : null
+    piModule("@earendil-works/pi-agent-core", "dist/index.js")
   );
   set("@earendil-works/pi-agent-core", agentCore);
   set("@mariozechner/pi-agent-core", agentCore);
   const tui = firstExisting(
     resolveSpec("@earendil-works/pi-tui"),
-    nm ? join2(nm, "@earendil-works/pi-tui/dist/index.js") : null
+    piModule("@earendil-works/pi-tui", "dist/index.js")
   );
   set("@earendil-works/pi-tui", tui);
   set("@mariozechner/pi-tui", tui);
   const aiCompat = firstExisting(
     resolveSpec("@earendil-works/pi-ai/compat"),
-    nm ? join2(nm, "@earendil-works/pi-ai/dist/compat.js") : null
+    piModule("@earendil-works/pi-ai", "dist/compat.js")
   );
   const aiOauth = firstExisting(
     resolveSpec("@earendil-works/pi-ai/oauth"),
-    nm ? join2(nm, "@earendil-works/pi-ai/dist/oauth.js") : null
+    piModule("@earendil-works/pi-ai", "dist/oauth.js")
   );
   const aiProviders = firstExisting(
     resolveSpec("@earendil-works/pi-ai/providers/all"),
-    nm ? join2(nm, "@earendil-works/pi-ai/dist/providers/all.js") : null
+    piModule("@earendil-works/pi-ai", "dist/providers/all.js")
   );
   set("@earendil-works/pi-ai/providers/all", aiProviders);
   set("@mariozechner/pi-ai/providers/all", aiProviders);
@@ -391,8 +392,12 @@ async function buildAliases() {
   set("@mariozechner/pi-ai/oauth", aiOauth);
   set("@earendil-works/pi-ai/compat", aiCompat);
   set("@mariozechner/pi-ai/compat", aiCompat);
-  set("@earendil-works/pi-ai", aiCompat);
-  set("@mariozechner/pi-ai", aiCompat);
+  const ai = firstExisting(
+    resolveSpec("@earendil-works/pi-ai"),
+    piModule("@earendil-works/pi-ai", "dist/index.js")
+  );
+  set("@earendil-works/pi-ai", ai);
+  set("@mariozechner/pi-ai", ai);
   const typebox = resolveSpec("typebox");
   const typeboxCompile = resolveSpec("typebox/compile");
   const typeboxValue = resolveSpec("typebox/value");
