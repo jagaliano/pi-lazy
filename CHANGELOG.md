@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Retry npm publishing without provenance only when npm reports an existing transparency-log entry.
+
 ## 0.2.1
 
 - Include required Pi runtime dependencies in the published package so the compiled extension entry resolves after installation.
