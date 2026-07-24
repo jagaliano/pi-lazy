@@ -1,6 +1,6 @@
 {
   "name": "@rahularya01/pi-lazy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "LazyVim-style extension manager for Pi Coding Agent — load packages after start or on demand (cmd/tools/keywords).",
   "author": "Rahul Arya",
   "license": "MIT",
@@ -51,20 +51,16 @@
       "./dist/index.js"
     ]
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "typebox": "^1.0.17"
   },
-  "peerDependenciesMeta": {
-    "typebox": {
-      "optional": true
-    }
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1",
     "@types/node": "^24.0.0",
     "esbuild": "^0.25.12",
-    "typebox": "^1.0.17",
     "typescript": "^5.9.0"
   },
   "engines": {

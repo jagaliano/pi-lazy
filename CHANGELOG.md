@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Include required Pi runtime dependencies in the published package so the compiled extension entry resolves after installation.
+
 ## 0.2.0
 
 - Defer package resolution until first load and cache jiti/Pi loader setup.
