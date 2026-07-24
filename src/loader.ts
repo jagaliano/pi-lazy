@@ -1,0 +1,436 @@
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { LoadResult, ResolvedEntry } from "./types.ts";
+
+type AnyHandler = (event: any, ctx: ExtensionContext) => any;
+
+interface LoadTrack {
+	tools: string[];
+	commands: string[];
+	sessionStartHandlers: AnyHandler[];
+	resourcesDiscoverHandlers: AnyHandler[];
+}
+
+function fileUrl(path: string): string {
+	return pathToFileURL(path).href;
+}
+
+function asFactory(mod: unknown): ((api: ExtensionAPI) => unknown) | null {
+	if (typeof mod === "function") return mod as (api: ExtensionAPI) => unknown;
+	if (mod && typeof mod === "object") {
+		const d = (mod as { default?: unknown }).default;
+		if (typeof d === "function") return d as (api: ExtensionAPI) => unknown;
+	}
+	return null;
+}
+
+function resolvePiPackageJson(): string | null {
+	try {
+		const url = import.meta.resolve("@earendil-works/pi-coding-agent/package.json");
+		return fileURLToPath(url);
+	} catch {
+		/* fall through */
+	}
+	try {
+		const require = createRequire(import.meta.url);
+		return require.resolve("@earendil-works/pi-coding-agent/package.json");
+	} catch {
+		/* fall through */
+	}
+
+	// Walk from the running pi binary / entry script
+	try {
+		const bin = realpathSync(process.argv[1] ?? "");
+		let dir = dirname(bin);
+		for (let i = 0; i < 10; i++) {
+			const pkgPath = join(dir, "package.json");
+			if (existsSync(pkgPath)) {
+				try {
+					const name = (JSON.parse(readFileSync(pkgPath, "utf-8")) as { name?: string }).name;
+					if (name === "@earendil-works/pi-coding-agent" || name === "@mariozechner/pi-coding-agent") {
+						return pkgPath;
+					}
+				} catch {
+					/* ignore */
+				}
+			}
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	} catch {
+		/* ignore */
+	}
+
+	// Common global npm layouts
+	for (const guess of [
+		join(dirname(process.execPath), "../lib/node_modules/@earendil-works/pi-coding-agent/package.json"),
+		join(dirname(process.execPath), "../lib/node_modules/@mariozechner/pi-coding-agent/package.json"),
+	]) {
+		if (existsSync(guess)) return guess;
+	}
+
+	return null;
+}
+
+function resolveJitiCreate(): ((...args: any[]) => any) | null {
+	const candidates: string[] = [];
+	const pushResolve = (from: string) => {
+		try {
+			const require = createRequire(from);
+			candidates.push(require.resolve("jiti"));
+		} catch {
+			/* ignore */
+		}
+	};
+
+	const piPkg = resolvePiPackageJson();
+	if (piPkg) pushResolve(piPkg);
+	pushResolve(fileURLToPath(import.meta.url));
+
+	// Walk up from pi package for nested node_modules/jiti (global npm installs)
+	if (piPkg) {
+		let dir = dirname(piPkg);
+		for (let i = 0; i < 6; i++) {
+			const nested = join(dir, "node_modules", "jiti", "lib", "jiti.cjs");
+			const nestedPkg = join(dir, "node_modules", "jiti", "package.json");
+			if (existsSync(nestedPkg)) {
+				try {
+					const require = createRequire(nestedPkg);
+					candidates.push(require.resolve("jiti"));
+				} catch {
+					if (existsSync(nested)) candidates.push(nested);
+				}
+				break;
+			}
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	}
+
+	for (const jitiPath of [...new Set(candidates)]) {
+		try {
+			const require = createRequire(jitiPath);
+			const jitiMod = require(jitiPath) as { createJiti?: (...args: any[]) => any } | ((...args: any[]) => any);
+			if (typeof jitiMod === "function") {
+				return (filename: string, opts: object) => {
+					const j = (jitiMod as Function)(filename, opts);
+					return {
+						import: async (path: string, _opts?: object) => j(path),
+					};
+				};
+			}
+			if (jitiMod?.createJiti) return jitiMod.createJiti.bind(jitiMod);
+		} catch {
+			/* try next */
+		}
+	}
+	return null;
+}
+
+async function importFactory(extensionPath: string): Promise<((api: ExtensionAPI) => unknown) | null> {
+	// Prefer native import for compiled JS; fall back to jiti for TS.
+	if (/\.(js|mjs|cjs)$/.test(extensionPath)) {
+		try {
+			const mod = await import(fileUrl(extensionPath));
+			const factory = asFactory(mod);
+			if (factory) return factory;
+		} catch {
+			/* try jiti */
+		}
+	}
+
+	const createJiti = resolveJitiCreate();
+	if (!createJiti) {
+		throw new Error("jiti not available — cannot load TypeScript extensions at runtime");
+	}
+
+	try {
+		const aliases = await buildAliases();
+		const jiti = createJiti(import.meta.url, {
+			interopDefault: true,
+			alias: aliases,
+		});
+		// jiti v2
+		if (typeof jiti.import === "function") {
+			try {
+				const mod = await jiti.import(extensionPath, { default: true });
+				const factory = asFactory(mod);
+				if (factory) return factory;
+			} catch {
+				/* try namespace import */
+			}
+			const mod = await jiti.import(extensionPath);
+			return asFactory(mod);
+		}
+		// unexpected shape
+		return asFactory(jiti(extensionPath));
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to import extension module ${extensionPath}: ${message}`);
+	}
+}
+
+function tryResolveFrom(fromPkgJson: string | null, spec: string): string | null {
+	if (!fromPkgJson) return null;
+	try {
+		const require = createRequire(fromPkgJson);
+		return require.resolve(spec);
+	} catch {
+		return null;
+	}
+}
+
+function firstExisting(...paths: Array<string | null | undefined>): string | null {
+	for (const p of paths) {
+		if (p && existsSync(p)) return p;
+	}
+	return null;
+}
+
+async function buildAliases(): Promise<Record<string, string>> {
+	const aliases: Record<string, string> = {};
+	const piPkg = resolvePiPackageJson();
+	const piRoot = piPkg ? dirname(piPkg) : null;
+	const nm = piRoot ? join(piRoot, "node_modules") : null;
+	const requireFromPi = piPkg ? createRequire(piPkg) : null;
+
+	const set = (spec: string, path: string | null | undefined) => {
+		if (path) aliases[spec] = path;
+	};
+
+	const resolveSpec = (spec: string): string | null => {
+		try {
+			const resolved = import.meta.resolve(spec);
+			return resolved.startsWith("file:") ? fileURLToPath(resolved) : resolved;
+		} catch {
+			/* fall through */
+		}
+		if (requireFromPi) {
+			try {
+				return requireFromPi.resolve(spec);
+			} catch {
+				/* ignore */
+			}
+		}
+		return tryResolveFrom(piPkg, spec);
+	};
+
+	// Core pi packages — prefer explicit dist files (package exports are often incomplete)
+	const piCoding = firstExisting(
+		resolveSpec("@earendil-works/pi-coding-agent"),
+		piRoot ? join(piRoot, "dist/index.js") : null,
+	);
+	set("@earendil-works/pi-coding-agent", piCoding);
+	set("@mariozechner/pi-coding-agent", piCoding);
+
+	const agentCore = firstExisting(
+		resolveSpec("@earendil-works/pi-agent-core"),
+		nm ? join(nm, "@earendil-works/pi-agent-core/dist/index.js") : null,
+	);
+	set("@earendil-works/pi-agent-core", agentCore);
+	set("@mariozechner/pi-agent-core", agentCore);
+
+	const tui = firstExisting(
+		resolveSpec("@earendil-works/pi-tui"),
+		nm ? join(nm, "@earendil-works/pi-tui/dist/index.js") : null,
+	);
+	set("@earendil-works/pi-tui", tui);
+	set("@mariozechner/pi-tui", tui);
+
+	const aiCompat = firstExisting(
+		resolveSpec("@earendil-works/pi-ai/compat"),
+		nm ? join(nm, "@earendil-works/pi-ai/dist/compat.js") : null,
+	);
+	const aiOauth = firstExisting(
+		resolveSpec("@earendil-works/pi-ai/oauth"),
+		nm ? join(nm, "@earendil-works/pi-ai/dist/oauth.js") : null,
+	);
+	const aiProviders = firstExisting(
+		resolveSpec("@earendil-works/pi-ai/providers/all"),
+		nm ? join(nm, "@earendil-works/pi-ai/dist/providers/all.js") : null,
+	);
+
+	// IMPORTANT: register longer subpaths before the package root alias
+	set("@earendil-works/pi-ai/providers/all", aiProviders);
+	set("@mariozechner/pi-ai/providers/all", aiProviders);
+	set("@earendil-works/pi-ai/oauth", aiOauth);
+	set("@mariozechner/pi-ai/oauth", aiOauth);
+	set("@earendil-works/pi-ai/compat", aiCompat);
+	set("@mariozechner/pi-ai/compat", aiCompat);
+	set("@earendil-works/pi-ai", aiCompat);
+	set("@mariozechner/pi-ai", aiCompat);
+
+	// typebox subpath exports must be exact
+	const typebox = resolveSpec("typebox");
+	const typeboxCompile = resolveSpec("typebox/compile");
+	const typeboxValue = resolveSpec("typebox/value");
+	set("typebox", typebox);
+	set("typebox/compile", typeboxCompile);
+	set("typebox/value", typeboxValue);
+	set("@sinclair/typebox", typebox);
+	set("@sinclair/typebox/compile", typeboxCompile);
+	set("@sinclair/typebox/value", typeboxValue);
+
+	return aliases;
+}
+
+function createTrackingApi(pi: ExtensionAPI, track: LoadTrack): ExtensionAPI {
+	const on = (event: string, handler: AnyHandler) => {
+		if (event === "session_start") track.sessionStartHandlers.push(handler);
+		if (event === "resources_discover") track.resourcesDiscoverHandlers.push(handler);
+		return (pi.on as Function)(event, handler);
+	};
+
+	const registerTool = (tool: { name: string }) => {
+		track.tools.push(tool.name);
+		return pi.registerTool(tool as any);
+	};
+
+	const registerCommand = (name: string, options: unknown) => {
+		track.commands.push(name);
+		return pi.registerCommand(name, options as any);
+	};
+
+	return new Proxy(pi, {
+		get(target, prop, receiver) {
+			if (prop === "on") return on;
+			if (prop === "registerTool") return registerTool;
+			if (prop === "registerCommand") return registerCommand;
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as ExtensionAPI;
+}
+
+/**
+ * Load a resolved lazy package into the live host ExtensionAPI.
+ */
+export async function loadResolvedEntry(
+	entry: ResolvedEntry,
+	pi: ExtensionAPI,
+	ctx: ExtensionContext | undefined,
+	deps: {
+		loadDependency: (name: string) => Promise<LoadResult>;
+	},
+): Promise<LoadResult> {
+	const { spec } = entry;
+	if (entry.state === "loaded") {
+		return {
+			ok: true,
+			name: spec.name,
+			alreadyLoaded: true,
+			tools: entry.loadedTools,
+			commands: entry.loadedCommands,
+			loadMs: entry.loadMs,
+		};
+	}
+	if (entry.state === "loading") {
+		return { ok: false, name: spec.name, error: "already loading" };
+	}
+	if (!entry.moduleLazyReady) {
+		return {
+			ok: false,
+			name: spec.name,
+			error: "not module-lazy ready — run /lazy migrate and restart pi (package still eager-loaded by settings)",
+		};
+	}
+	if (!entry.packageRoot || entry.extensionPaths.length === 0) {
+		return {
+			ok: false,
+			name: spec.name,
+			error: entry.packageRoot
+				? "no extension entrypoints found in package"
+				: `package not installed for ${spec.source}`,
+		};
+	}
+
+	// Dependencies first
+	for (const dep of spec.dependencies ?? []) {
+		const depResult = await deps.loadDependency(dep);
+		if (!depResult.ok && !depResult.alreadyLoaded) {
+			return { ok: false, name: spec.name, error: `dependency ${dep} failed: ${depResult.error}` };
+		}
+	}
+
+	entry.state = "loading";
+	const started = Date.now();
+	const track: LoadTrack = {
+		tools: [],
+		commands: [],
+		sessionStartHandlers: [],
+		resourcesDiscoverHandlers: [],
+	};
+	const api = createTrackingApi(pi, track);
+
+	try {
+		for (const extPath of entry.extensionPaths) {
+			const factory = await importFactory(extPath);
+			if (!factory) {
+				throw new Error(`Extension does not export a default factory: ${extPath}`);
+			}
+			await factory(api);
+		}
+
+		// Replay session_start for factories that registered too late for the real event.
+		if (ctx && track.sessionStartHandlers.length > 0) {
+			const event = { type: "session_start" as const, reason: "startup" as const };
+			for (const handler of track.sessionStartHandlers) {
+				try {
+					await handler(event, ctx);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					console.error(`[pi-lazy] session_start handler error in ${spec.name}: ${message}`);
+				}
+			}
+		}
+
+		// Best-effort resources_discover (skills/prompts already eager if not filtered)
+		if (ctx && track.resourcesDiscoverHandlers.length > 0) {
+			const event = { type: "resources_discover" as const, cwd: ctx.cwd, reason: "startup" as const };
+			for (const handler of track.resourcesDiscoverHandlers) {
+				try {
+					await handler(event, ctx);
+				} catch {
+					/* ignore */
+				}
+			}
+		}
+
+		// Activate newly registered tools additively when possible
+		if (track.tools.length > 0 && typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
+			try {
+				const active = pi.getActiveTools();
+				const merged = [...new Set([...active, ...track.tools])];
+				pi.setActiveTools(merged);
+			} catch {
+				/* runtime may not be bound yet */
+			}
+		}
+
+		const loadMs = Date.now() - started;
+		entry.state = "loaded";
+		entry.loadedAt = Date.now();
+		entry.loadMs = loadMs;
+		entry.loadedTools = track.tools;
+		entry.loadedCommands = track.commands;
+		entry.error = undefined;
+
+		return {
+			ok: true,
+			name: spec.name,
+			loadMs,
+			tools: track.tools,
+			commands: track.commands,
+		};
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		entry.state = "error";
+		entry.error = message;
+		return { ok: false, name: spec.name, error: message };
+	}
+}

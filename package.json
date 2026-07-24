@@ -1,0 +1,67 @@
+{
+  "name": "@rahularya01/pi-lazy",
+  "version": "0.1.0",
+  "description": "LazyVim-style extension manager for Pi Coding Agent — load packages after start or on demand (cmd/tools/keywords).",
+  "author": "Rahul Arya",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "lazy",
+    "lazyvim",
+    "extensions",
+    "performance",
+    "startup"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rahularya01/pi-lazy.git"
+  },
+  "homepage": "https://github.com/Rahularya01/pi-lazy#readme",
+  "bugs": {
+    "url": "https://github.com/Rahularya01/pi-lazy/issues"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "src",
+    "examples"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.0.17",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
