@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Resolve lazy-loaded extension peer dependencies from the active Pi runtime,
+  including hoisted Bun/npm installations.
+
 ## 0.2.2
 
 - Retry npm publishing without provenance only when npm reports an existing transparency-log entry.
