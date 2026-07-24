@@ -38,11 +38,12 @@
     "access": "public"
   },
   "scripts": {
+    "check": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test:integration": "node scripts/integration-load.mjs",
     "test:smoke": "node scripts/smoke-pi.mjs",
     "test": "npm run typecheck && npm run test:integration",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run check"
   },
   "pi": {
     "extensions": [

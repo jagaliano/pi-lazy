@@ -465,12 +465,33 @@ Layout:
 
 ## Publish
 
+CI runs typecheck on every push/PR to `main`.
+
+Releases publish to npm automatically when a version tag is pushed:
+
+```bash
+# 1. Bump version in package.json + CHANGELOG.md, commit to main
+# 2. Tag must match package.json (e.g. 0.1.1 → v0.1.1)
+git tag v0.1.1
+git push origin main --tags
+```
+
+GitHub Actions (`.github/workflows/publish.yml`) will:
+
+1. Install deps and run `npm run check`
+2. Assert the tag matches `package.json` version
+3. `npm publish --access public --provenance`
+
+**Required secret:** repo `NPM_TOKEN` (npm automation/granular access token with publish rights for `@rahularya01`).
+
+Manual publish (fallback):
+
 ```bash
 npm login
 npm publish --access public
 ```
 
-Then:
+Then reinstall in Pi:
 
 ```bash
 pi install npm:@rahularya01/pi-lazy
