@@ -14,10 +14,8 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { isManagedLazy, loadConfig, saveConfig, defaultConfig, getLazyConfigPath } from "./config.ts";
 import { loadResolvedEntry } from "./loader.ts";
 import { migrateSettings } from "./migrate.ts";
-import {
-	isModuleLazyInSettings,
-	resolveSpecPaths,
-} from "./resolve.ts";
+import { isModuleLazyInSettings, resolveSpecPaths } from "./resolve.ts";
+import { performance } from "node:perf_hooks";
 import type { LazyConfig, LoadResult, ResolvedEntry } from "./types.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { getSettingsPath } from "./config.ts";
@@ -29,6 +27,8 @@ interface Runtime {
 	sessionCtx?: ExtensionContext;
 	afterStartQueued: boolean;
 	status: string;
+	profile: Array<{ label: string; ms: number }>;
+	queueCancelled: boolean;
 }
 
 function readSettingsPackages(agentDir: string): unknown[] {
@@ -47,7 +47,6 @@ function buildCatalog(config: LazyConfig, agentDir: string, cwd: string): Map<st
 	const map = new Map<string, ResolvedEntry>();
 
 	for (const spec of config.specs) {
-		const { packageRoot, extensionPaths } = resolveSpecPaths(spec, agentDir, cwd);
 		const managed = isManagedLazy(spec);
 		const moduleLazyReady = managed && isModuleLazyInSettings(spec.source, packages);
 
@@ -63,8 +62,9 @@ function buildCatalog(config: LazyConfig, agentDir: string, cwd: string): Map<st
 
 		map.set(spec.name, {
 			spec,
-			packageRoot: packageRoot ?? "",
-			extensionPaths,
+			// Avoid filesystem/package.json scans for packages that are never loaded.
+			packageRoot: "",
+			extensionPaths: [],
 			moduleLazyReady,
 			state,
 		});
@@ -93,6 +93,11 @@ function refreshStatus(pi: ExtensionAPI, rt: Runtime, ctx?: ExtensionContext) {
 	}
 }
 
+function recordTiming(rt: Runtime, label: string, started: number) {
+	rt.profile.push({ label, ms: performance.now() - started });
+	if (rt.profile.length > 100) rt.profile.shift();
+}
+
 async function loadByName(pi: ExtensionAPI, rt: Runtime, name: string, ctx?: ExtensionContext): Promise<LoadResult> {
 	const key = name.trim();
 	const entry =
@@ -115,9 +120,20 @@ async function loadByName(pi: ExtensionAPI, rt: Runtime, name: string, ctx?: Ext
 		};
 	}
 
+	// Resolve package metadata only on first actual load, not during startup catalog creation.
+	if (!entry.packageRoot && entry.extensionPaths.length === 0) {
+		const started = performance.now();
+		const resolved = resolveSpecPaths(entry.spec, getAgentDir(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
+		entry.packageRoot = resolved.packageRoot ?? "";
+		entry.extensionPaths = resolved.extensionPaths;
+		entry.resolveMs = performance.now() - started;
+		recordTiming(rt, `resolve:${entry.spec.name}`, started);
+	}
+	const started = performance.now();
 	const result = await loadResolvedEntry(entry, pi, ctx ?? rt.sessionCtx, {
 		loadDependency: (dep) => loadByName(pi, rt, dep, ctx),
 	});
+	recordTiming(rt, `load:${entry.spec.name}`, started);
 
 	refreshStatus(pi, rt, ctx ?? rt.sessionCtx);
 	return result;
@@ -243,7 +259,8 @@ function registerEventTriggers(pi: ExtensionAPI, rt: Runtime) {
 			}
 		}
 
-		for (const name of toLoad) {
+		const limit = rt.config.autoLoadLimit ?? 1;
+		for (const name of [...toLoad].slice(0, limit)) {
 			const res = await loadByName(pi, rt, name, ctx);
 			if (res.ok && !res.alreadyLoaded) {
 				ctx.ui.notify(`lazy: auto-loaded ${name}`, "info");
@@ -257,10 +274,15 @@ async function runAfterStart(pi: ExtensionAPI, rt: Runtime, ctx: ExtensionContex
 		.filter((e) => e.state === "pending" && e.spec.lazy === "after-start")
 		.sort((a, b) => (a.spec.priority ?? 100) - (b.spec.priority ?? 100));
 
-	for (const entry of queue) {
-		const res = await loadByName(pi, rt, entry.spec.name, ctx);
-		if (!res.ok) {
-			ctx.ui.notify(`lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
+	const batchSize = rt.config.afterStartBatchSize ?? 1;
+	const delayMs = rt.config.afterStartDelayMs ?? 0;
+	for (let i = 0; i < queue.length && !rt.queueCancelled; i += batchSize) {
+		for (const entry of queue.slice(i, i + batchSize)) {
+			const res = await loadByName(pi, rt, entry.spec.name, ctx);
+			if (!res.ok) ctx.ui.notify(`lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
+		}
+		if (i + batchSize < queue.length && !rt.queueCancelled) {
+			await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 		}
 	}
 	refreshStatus(pi, rt, ctx);
@@ -295,14 +317,18 @@ export default function piLazy(pi: ExtensionAPI) {
 		auto: config.auto !== false,
 		afterStartQueued: false,
 		status: "lazy …",
+		profile: [],
+		queueCancelled: false,
 	};
 
 	// Catalog is rebuilt on session_start with cwd
 	const rebuild = (cwd: string) => {
+		const started = performance.now();
 		rt.config = loadConfig(agentDir);
 		rt.auto = rt.config.auto !== false;
 		rt.entries = buildCatalog(rt.config, agentDir, cwd);
 		rt.status = formatStatus(rt);
+		recordTiming(rt, "catalog", started);
 	};
 
 	rebuild(process.cwd());
@@ -311,6 +337,7 @@ export default function piLazy(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		rt.sessionCtx = ctx;
+		rt.queueCancelled = false;
 		rebuild(ctx.cwd);
 		// Re-register stubs only for still-pending entries — commands/tools already registered
 		// at factory time stay; new pending set is fine for this session.
@@ -335,12 +362,13 @@ export default function piLazy(pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		rt.sessionCtx = undefined;
 		rt.afterStartQueued = false;
+		rt.queueCancelled = true;
 	});
 
 	pi.registerCommand("lazy", {
 		description: "LazyVim-style extension manager (list|load|migrate|auto|init|status)",
 		getArgumentCompletions: (prefix) => {
-			const sub = ["status", "list", "load", "migrate", "auto", "init", "config"];
+			const sub = ["status", "list", "load", "migrate", "auto", "init", "config", "profile"];
 			const names = [...rt.entries.keys()].map((n) => `load ${n}`);
 			const items = [...sub, ...names, "auto on", "auto off"].map((v) => ({ value: v, label: v }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix) || i.value.includes(prefix));
@@ -370,6 +398,14 @@ export default function piLazy(pi: ExtensionAPI) {
 
 			if (sub === "config") {
 				ctx.ui.notify(getLazyConfigPath(agentDir), "info");
+				return;
+			}
+
+			if (sub === "profile") {
+				const lines = rt.profile.length
+					? rt.profile.map((item) => `${item.label.padEnd(24)} ${item.ms.toFixed(1)}ms`)
+					: ["no timings recorded"];
+				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
 
@@ -436,7 +472,7 @@ export default function piLazy(pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify("usage: /lazy [status|list|load <name>|migrate|auto on|off|init|config]", "warning");
+			ctx.ui.notify("usage: /lazy [status|list|profile|load <name>|migrate|auto on|off|init|config]", "warning");
 		},
 	});
 

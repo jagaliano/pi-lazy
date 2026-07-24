@@ -1,6 +1,6 @@
 {
   "name": "@rahularya01/pi-lazy",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "LazyVim-style extension manager for Pi Coding Agent — load packages after start or on demand (cmd/tools/keywords).",
   "author": "Rahul Arya",
   "license": "MIT",
@@ -27,27 +27,28 @@
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
-    "src",
+    "dist",
     "examples"
   ],
   "exports": {
-    ".": "./src/index.ts",
+    ".": "./dist/index.js",
     "./package.json": "./package.json"
   },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "check": "tsc --noEmit",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --external:@earendil-works/pi-coding-agent --external:typebox",
+    "check": "npm run typecheck && npm run build",
     "typecheck": "tsc --noEmit",
     "test:integration": "node scripts/integration-load.mjs",
     "test:smoke": "node scripts/smoke-pi.mjs",
-    "test": "npm run typecheck && npm run test:integration",
-    "prepublishOnly": "npm run check"
+    "test": "npm run check && npm run test:integration",
+    "prepublishOnly": "npm run check && npm pack --dry-run"
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   },
   "peerDependencies": {
@@ -62,6 +63,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.81.1",
     "@types/node": "^24.0.0",
+    "esbuild": "^0.25.12",
     "typebox": "^1.0.17",
     "typescript": "^5.9.0"
   },

@@ -27,16 +27,23 @@ function asFactory(mod: unknown): ((api: ExtensionAPI) => unknown) | null {
 	return null;
 }
 
+let cachedPiPackageJson: string | null | undefined;
+let cachedCreateJiti: ((...args: any[]) => any) | null | undefined;
+let aliasesPromise: Promise<Record<string, string>> | undefined;
+let jitiInstance: any | undefined;
+
 function resolvePiPackageJson(): string | null {
+	if (cachedPiPackageJson !== undefined) return cachedPiPackageJson;
+	const finish = (value: string | null) => (cachedPiPackageJson = value);
 	try {
 		const url = import.meta.resolve("@earendil-works/pi-coding-agent/package.json");
-		return fileURLToPath(url);
+		return finish(fileURLToPath(url));
 	} catch {
 		/* fall through */
 	}
 	try {
 		const require = createRequire(import.meta.url);
-		return require.resolve("@earendil-works/pi-coding-agent/package.json");
+		return finish(require.resolve("@earendil-works/pi-coding-agent/package.json"));
 	} catch {
 		/* fall through */
 	}
@@ -51,7 +58,7 @@ function resolvePiPackageJson(): string | null {
 				try {
 					const name = (JSON.parse(readFileSync(pkgPath, "utf-8")) as { name?: string }).name;
 					if (name === "@earendil-works/pi-coding-agent" || name === "@mariozechner/pi-coding-agent") {
-						return pkgPath;
+						return finish(pkgPath);
 					}
 				} catch {
 					/* ignore */
@@ -70,13 +77,14 @@ function resolvePiPackageJson(): string | null {
 		join(dirname(process.execPath), "../lib/node_modules/@earendil-works/pi-coding-agent/package.json"),
 		join(dirname(process.execPath), "../lib/node_modules/@mariozechner/pi-coding-agent/package.json"),
 	]) {
-		if (existsSync(guess)) return guess;
+		if (existsSync(guess)) return finish(guess);
 	}
 
-	return null;
+	return finish(null);
 }
 
 function resolveJitiCreate(): ((...args: any[]) => any) | null {
+	if (cachedCreateJiti !== undefined) return cachedCreateJiti;
 	const candidates: string[] = [];
 	const pushResolve = (from: string) => {
 		try {
@@ -124,17 +132,17 @@ function resolveJitiCreate(): ((...args: any[]) => any) | null {
 			// Never wrap with sync j(path) — that rewrites ESM/TS to CJS and breaks
 			// top-level await (e.g. rpiv-todo / rpiv-ask-user-question).
 			if (typeof jitiMod?.createJiti === "function") {
-				return jitiMod.createJiti.bind(jitiMod);
+				return (cachedCreateJiti = jitiMod.createJiti.bind(jitiMod));
 			}
 			if (typeof jitiMod === "function") {
 				// Already createJiti (or a compatible factory).
-				return jitiMod;
+				return (cachedCreateJiti = jitiMod);
 			}
 		} catch {
 			/* try next */
 		}
 	}
-	return null;
+	return (cachedCreateJiti = null);
 }
 
 async function importFactory(extensionPath: string): Promise<((api: ExtensionAPI) => unknown) | null> {
@@ -155,13 +163,13 @@ async function importFactory(extensionPath: string): Promise<((api: ExtensionAPI
 	}
 
 	try {
-		const aliases = await buildAliases();
-		const jiti = createJiti(import.meta.url, {
+		const aliases = await (aliasesPromise ??= buildAliases());
+		const jiti = (jitiInstance ??= createJiti(import.meta.url, {
 			interopDefault: true,
-			// Match pi-core: avoid stale transformed modules across reloads.
+			// Keep transformed extension modules fresh across reloads.
 			moduleCache: false,
 			alias: aliases,
-		});
+		}));
 		// jiti v2 instance exposes async .import (handles top-level await).
 		if (jiti && typeof jiti.import === "function") {
 			try {

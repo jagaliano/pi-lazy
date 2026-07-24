@@ -195,6 +195,9 @@ Full example (also in [`examples/lazy.json`](./examples/lazy.json)):
   "version": 1,
   "defaults": { "lazy": true },
   "auto": true,
+  "autoLoadLimit": 1,
+  "afterStartBatchSize": 1,
+  "afterStartDelayMs": 0,
   "specs": [
     {
       "name": "cursor",
@@ -237,6 +240,9 @@ Full example (also in [`examples/lazy.json`](./examples/lazy.json)):
 | `version` | `1` | Config schema version |
 | `defaults.lazy` | `false` \| `true` \| `"after-start"` | Default when a spec omits `lazy` (default: `true`) |
 | `auto` | boolean | Enable keyword/event auto-load (default: `true`) |
+| `autoLoadLimit` | integer | Maximum packages loaded before one agent turn (default: `1`) |
+| `afterStartBatchSize` | integer | Packages loaded in one after-start event-loop slice (default: `1`) |
+| `afterStartDelayMs` | integer | Delay between after-start slices in milliseconds (default: `0`) |
 | `specs` | array | Package load catalog |
 
 ### Spec fields
@@ -312,6 +318,7 @@ Declare the commands and tools you care about triggering:
 | `/lazy auto on\|off` | Toggle auto-load and persist to `lazy.json` |
 | `/lazy init` | Overwrite `lazy.json` with the built-in default catalog |
 | `/lazy config` | Print the absolute path to `lazy.json` |
+| `/lazy profile` | Show in-session catalog, resolution, and load timings |
 
 Tab completion is available for subcommands and `load <name>`.
 
@@ -446,6 +453,10 @@ git clone https://github.com/Rahularya01/pi-lazy
 cd pi-lazy
 npm install
 npm run typecheck
+npm run build
+
+# run an isolated startup benchmark; never modifies ~/.pi/agent
+BENCH_RUNS=3 node scripts/bench-startup.mjs
 
 # load from local path
 pi install "$PWD"
@@ -455,11 +466,12 @@ Layout:
 
 | Path | Role |
 | ---- | ---- |
-| `src/index.ts` | Extension entry — commands, stubs, events, `lazy_load` |
+| `src/index.ts` | Extension entry — commands, stubs, events, `lazy_load`, profiling |
 | `src/config.ts` | `lazy.json` load/save + default catalog |
 | `src/migrate.ts` | `settings.packages` → `extensions: []` |
 | `src/resolve.ts` | Package root + extension entry resolution |
-| `src/loader.ts` | Dynamic import / jiti + factory invoke |
+| `src/loader.ts` | Dynamic import / cached jiti setup + factory invoke |
+| `dist/index.js` | Compiled production extension entry |
 | `src/types.ts` | Spec / config types |
 | `examples/lazy.json` | Example catalog |
 

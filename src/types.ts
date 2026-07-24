@@ -42,13 +42,21 @@ export interface LazyConfig {
 	};
 	/** When true, keyword/event auto-load is enabled (default true) */
 	auto?: boolean;
+	/** Maximum packages auto-loaded before one agent turn (default 1). */
+	autoLoadLimit?: number;
+	/** Number of after-start packages loaded in one event-loop slice (default 1). */
+	afterStartBatchSize?: number;
+	/** Delay between after-start slices in milliseconds (default 0). */
+	afterStartDelayMs?: number;
 	specs: LazySpec[];
 }
 
 export interface ResolvedEntry {
 	spec: LazySpec;
+	/** Resolved only when the package is first requested. */
 	packageRoot: string;
 	extensionPaths: string[];
+	resolveMs?: number;
 	/** True when settings filter keeps extensions[] empty so Pi won't eager-load */
 	moduleLazyReady: boolean;
 	state: SpecState;

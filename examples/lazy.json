@@ -4,6 +4,9 @@
     "lazy": true
   },
   "auto": true,
+  "autoLoadLimit": 1,
+  "afterStartBatchSize": 1,
+  "afterStartDelayMs": 0,
   "specs": [
     {
       "name": "grok-cli",

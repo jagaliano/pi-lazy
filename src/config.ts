@@ -18,6 +18,9 @@ export function defaultConfig(): LazyConfig {
 		version: 1,
 		defaults: { lazy: true },
 		auto: true,
+		autoLoadLimit: 1,
+		afterStartBatchSize: 1,
+		afterStartDelayMs: 0,
 		specs: [
 			// Providers / always-on identity
 			{ name: "grok-cli", source: "npm:pi-grok-cli", lazy: false, description: "Grok CLI provider" },
@@ -115,6 +118,14 @@ export function normalizeMode(value: unknown, fallback: LazyMode = true): LazyMo
 	return fallback;
 }
 
+function normalizePositiveInteger(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
 export function loadConfig(agentDir = getAgentDir()): LazyConfig {
 	const path = getLazyConfigPath(agentDir);
 	if (!existsSync(path)) {
@@ -145,6 +156,9 @@ export function loadConfig(agentDir = getAgentDir()): LazyConfig {
 			version: 1,
 			defaults: { lazy: defaultsLazy },
 			auto: raw.auto !== false,
+			autoLoadLimit: normalizePositiveInteger(raw.autoLoadLimit, 1),
+			afterStartBatchSize: normalizePositiveInteger(raw.afterStartBatchSize, 1),
+			afterStartDelayMs: normalizeNonNegativeInteger(raw.afterStartDelayMs, 0),
 			specs,
 		};
 	} catch (err) {

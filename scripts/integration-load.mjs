@@ -4,14 +4,14 @@
  * then load every after-start + on-demand package and assert success.
  */
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
 const HOME = process.env.HOME;
 const AGENT = join(HOME, ".pi/agent");
 const PI_PKG = "/Users/rahularya/.nvm/versions/node/v24.11.1/lib/node_modules/@earendil-works/pi-coding-agent/package.json";
-const LAZY_ROOT = join(AGENT, "npm/node_modules/@rahularya01/pi-lazy");
+const LAZY_ROOT = process.env.LAZY_ROOT ? resolvePath(process.env.LAZY_ROOT) : process.cwd();
 
 function buildAliases() {
 	const requireFromPi = createRequire(PI_PKG);

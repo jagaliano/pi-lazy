@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- Defer package resolution until first load and cache jiti/Pi loader setup.
+- Publish a compiled `dist/index.js` extension entry.
+- Add cooperative after-start batching, bounded automatic loads, and `/lazy profile` timings.
+- Add an isolated startup benchmark that never mutates the live Pi agent configuration.
+
 ## 0.1.1
 
 - Fix jiti resolution: prefer `createJiti` over the CJS default function wrapper
