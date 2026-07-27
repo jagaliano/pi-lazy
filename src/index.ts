@@ -86,10 +86,31 @@ function formatStatus(rt: Runtime): string {
 
 function refreshStatus(pi: ExtensionAPI, rt: Runtime, ctx?: ExtensionContext) {
 	rt.status = formatStatus(rt);
-	const ui = ctx?.ui ?? undefined;
-	// setStatus is on ExtensionContext.ui
-	if (ui && typeof ui.setStatus === "function") {
-		ui.setStatus("pi-lazy", rt.status);
+	// Prefer the freshest known ctx: a passed-in ctx captured before an async
+	// gap (e.g. runAfterStart's setTimeout) can go stale if the session gets
+	// replaced/reloaded in the meantime, while rt.sessionCtx is updated
+	// synchronously by every session_start.
+	const target = rt.sessionCtx ?? ctx;
+	if (!target) return;
+	try {
+		// ctx.ui is a getter that throws once the ctx is stale, so even reading
+		// it must be guarded — a status-bar update is never worth crashing pi.
+		const ui = target.ui;
+		if (ui && typeof ui.setStatus === "function") {
+			ui.setStatus("pi-lazy", rt.status);
+		}
+	} catch {
+		// stale ctx — session was replaced/reloaded since this ctx was captured.
+	}
+}
+
+/** Best-effort notify: a stale ctx must never crash the whole pi process. */
+function notifySafe(ctx: ExtensionContext | undefined, message: string, type?: "info" | "warning" | "error") {
+	if (!ctx) return;
+	try {
+		ctx.ui.notify(message, type);
+	} catch {
+		// stale ctx — session was replaced/reloaded since this ctx was captured.
 	}
 }
 
@@ -261,9 +282,12 @@ function registerEventTriggers(pi: ExtensionAPI, rt: Runtime) {
 
 		const limit = rt.config.autoLoadLimit ?? 1;
 		for (const name of [...toLoad].slice(0, limit)) {
-			const res = await loadByName(pi, rt, name, ctx);
+			// Re-derive ctx after each await: the session can be replaced/reloaded
+			// mid-loop, which would make the closed-over `ctx` stale.
+			const current = rt.sessionCtx ?? ctx;
+			const res = await loadByName(pi, rt, name, current);
 			if (res.ok && !res.alreadyLoaded) {
-				ctx.ui.notify(`lazy: auto-loaded ${name}`, "info");
+				notifySafe(rt.sessionCtx ?? current, `lazy: auto-loaded ${name}`, "info");
 			}
 		}
 	});
@@ -278,14 +302,21 @@ async function runAfterStart(pi: ExtensionAPI, rt: Runtime, ctx: ExtensionContex
 	const delayMs = rt.config.afterStartDelayMs ?? 0;
 	for (let i = 0; i < queue.length && !rt.queueCancelled; i += batchSize) {
 		for (const entry of queue.slice(i, i + batchSize)) {
-			const res = await loadByName(pi, rt, entry.spec.name, ctx);
-			if (!res.ok) ctx.ui.notify(`lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
+			// The ctx passed in was captured by session_start before the
+			// setTimeout(0) that scheduled this call; if the session was
+			// replaced/reloaded in that gap (or between iterations here),
+			// rt.sessionCtx already points at the fresh one.
+			const current = rt.sessionCtx ?? ctx;
+			const res = await loadByName(pi, rt, entry.spec.name, current);
+			if (!res.ok) {
+				notifySafe(rt.sessionCtx ?? current, `lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
+			}
 		}
 		if (i + batchSize < queue.length && !rt.queueCancelled) {
 			await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 		}
 	}
-	refreshStatus(pi, rt, ctx);
+	refreshStatus(pi, rt, rt.sessionCtx ?? ctx);
 }
 
 function listLines(rt: Runtime): string[] {

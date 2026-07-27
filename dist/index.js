@@ -806,9 +806,21 @@ function formatStatus(rt) {
 }
 function refreshStatus(pi, rt, ctx) {
   rt.status = formatStatus(rt);
-  const ui = ctx?.ui ?? void 0;
-  if (ui && typeof ui.setStatus === "function") {
-    ui.setStatus("pi-lazy", rt.status);
+  const target = rt.sessionCtx ?? ctx;
+  if (!target) return;
+  try {
+    const ui = target.ui;
+    if (ui && typeof ui.setStatus === "function") {
+      ui.setStatus("pi-lazy", rt.status);
+    }
+  } catch {
+  }
+}
+function notifySafe(ctx, message, type) {
+  if (!ctx) return;
+  try {
+    ctx.ui.notify(message, type);
+  } catch {
   }
 }
 function recordTiming(rt, label, started) {
@@ -952,9 +964,10 @@ function registerEventTriggers(pi, rt) {
     }
     const limit = rt.config.autoLoadLimit ?? 1;
     for (const name of [...toLoad].slice(0, limit)) {
-      const res = await loadByName(pi, rt, name, ctx);
+      const current = rt.sessionCtx ?? ctx;
+      const res = await loadByName(pi, rt, name, current);
       if (res.ok && !res.alreadyLoaded) {
-        ctx.ui.notify(`lazy: auto-loaded ${name}`, "info");
+        notifySafe(rt.sessionCtx ?? current, `lazy: auto-loaded ${name}`, "info");
       }
     }
   });
@@ -965,14 +978,17 @@ async function runAfterStart(pi, rt, ctx) {
   const delayMs = rt.config.afterStartDelayMs ?? 0;
   for (let i = 0; i < queue.length && !rt.queueCancelled; i += batchSize) {
     for (const entry of queue.slice(i, i + batchSize)) {
-      const res = await loadByName(pi, rt, entry.spec.name, ctx);
-      if (!res.ok) ctx.ui.notify(`lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
+      const current = rt.sessionCtx ?? ctx;
+      const res = await loadByName(pi, rt, entry.spec.name, current);
+      if (!res.ok) {
+        notifySafe(rt.sessionCtx ?? current, `lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
+      }
     }
     if (i + batchSize < queue.length && !rt.queueCancelled) {
       await new Promise((resolve2) => setTimeout(resolve2, delayMs));
     }
   }
-  refreshStatus(pi, rt, ctx);
+  refreshStatus(pi, rt, rt.sessionCtx ?? ctx);
 }
 function listLines(rt) {
   const lines = [];

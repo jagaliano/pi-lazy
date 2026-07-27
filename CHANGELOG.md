@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4
+
+- Resilient stale-ctx handling: guard all async-gap `ctx.ui` accesses so a replaced/reloaded session never crashes the pi process.
+- Track `rt.sessionCtx` synchronously on `session_start` and prefer it over captured ctx across `loadByName` iterations, `setTimeout` gaps, and after-start batches.
+- Extract `notifySafe()` and `refreshStatus()` stale-ctx guards for reuse.
+
 ## 0.2.3
 
 - Resolve lazy-loaded extension peer dependencies from the active Pi runtime,
