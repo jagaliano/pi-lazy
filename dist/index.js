@@ -421,6 +421,8 @@ function createTrackingApi(pi, track) {
   };
   const registerCommand = (name, options) => {
     track.commands.push(name);
+    const handler = options?.handler;
+    if (typeof handler === "function") track.commandHandlers.set(name, handler);
     return pi.registerCommand(name, options);
   };
   return new Proxy(pi, {
@@ -442,6 +444,7 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
       alreadyLoaded: true,
       tools: entry.loadedTools,
       commands: entry.loadedCommands,
+      commandHandlers: entry.loadedCommandHandlers,
       loadMs: entry.loadMs
     };
   }
@@ -473,6 +476,7 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
   const track = {
     tools: [],
     commands: [],
+    commandHandlers: /* @__PURE__ */ new Map(),
     sessionStartHandlers: [],
     resourcesDiscoverHandlers: []
   };
@@ -519,13 +523,15 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
     entry.loadMs = loadMs;
     entry.loadedTools = track.tools;
     entry.loadedCommands = track.commands;
+    entry.loadedCommandHandlers = track.commandHandlers;
     entry.error = void 0;
     return {
       ok: true,
       name: spec.name,
       loadMs,
       tools: track.tools,
-      commands: track.commands
+      commands: track.commands,
+      commandHandlers: track.commandHandlers
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -898,11 +904,16 @@ function registerStubs(pi, rt) {
           ctx.ui.notify(`lazy: failed to load ${owner}: ${res.error}`, "error");
           return;
         }
-        const suffix = args?.trim() ? ` ${args.trim()}` : "";
-        pi.sendUserMessage(`/${cmd}${suffix}`, { deliverAs: "followUp" });
         if (!res.alreadyLoaded) {
           ctx.ui.notify(`lazy: loaded ${owner}${res.loadMs != null ? ` in ${res.loadMs}ms` : ""}`, "info");
         }
+        const real = rt.entries.get(owner)?.loadedCommandHandlers?.get(cmd);
+        if (real) {
+          await real(args, ctx);
+          return;
+        }
+        const suffix = args?.trim() ? ` ${args.trim()}` : "";
+        pi.sendUserMessage(`/${cmd}${suffix}`, { deliverAs: "followUp" });
       }
     });
   }

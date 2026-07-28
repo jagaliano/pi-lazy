@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.5
+
+- Fix stub command re-dispatch: after lazy-loading the real package, invoke its
+  captured `registerCommand` handler directly instead of re-injecting `/cmd`
+  via `sendUserMessage({ deliverAs: "followUp" })`. The follow-up path bypasses
+  slash-command dispatch entirely and lands the literal `/cmd` text in the
+  conversation as a plain chat message, so the real command (e.g. `/mcp`)
+  never actually ran on first invocation.
+- `loader.ts` now captures each `registerCommand` call's handler during the
+  tracked load and exposes it via `ResolvedEntry.loadedCommandHandlers` /
+  `LoadResult.commandHandlers`, keyed by command name.
+
 ## 0.2.4
 
 - Resilient stale-ctx handling: guard all async-gap `ctx.ui` accesses so a replaced/reloaded session never crashes the pi process.

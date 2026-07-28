@@ -206,12 +206,23 @@ function registerStubs(pi: ExtensionAPI, rt: Runtime) {
 					ctx.ui.notify(`lazy: failed to load ${owner}: ${res.error}`, "error");
 					return;
 				}
-				const suffix = args?.trim() ? ` ${args.trim()}` : "";
-				// Re-dispatch so the real command (now registered) handles it.
-				pi.sendUserMessage(`/${cmd}${suffix}`, { deliverAs: "followUp" });
 				if (!res.alreadyLoaded) {
 					ctx.ui.notify(`lazy: loaded ${owner}${res.loadMs != null ? ` in ${res.loadMs}ms` : ""}`, "info");
 				}
+				// Call the real command's handler in-process. sendUserMessage()
+				// injects text back into the conversation as a literal chat
+				// message rather than re-running slash-command dispatch, so a
+				// re-sent "/cmd" never reaches the newly loaded handler — it
+				// just gets shown to the LLM as a stray prompt.
+				const real = rt.entries.get(owner)?.loadedCommandHandlers?.get(cmd);
+				if (real) {
+					await real(args, ctx);
+					return;
+				}
+				// Fallback: package didn't register this exact command name
+				// (e.g. it renamed/aliased it internally). Best effort re-dispatch.
+				const suffix = args?.trim() ? ` ${args.trim()}` : "";
+				pi.sendUserMessage(`/${cmd}${suffix}`, { deliverAs: "followUp" });
 			},
 		});
 	}

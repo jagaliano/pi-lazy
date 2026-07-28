@@ -65,6 +65,8 @@ export interface ResolvedEntry {
 	loadMs?: number;
 	loadedTools?: string[];
 	loadedCommands?: string[];
+	/** Real command handlers captured while loading, keyed by command name. */
+	loadedCommandHandlers?: Map<string, (args: string, ctx: any) => Promise<void>>;
 }
 
 export interface LoadResult {
@@ -74,5 +76,7 @@ export interface LoadResult {
 	loadMs?: number;
 	tools?: string[];
 	commands?: string[];
+	/** Real command handlers captured while loading, keyed by command name. */
+	commandHandlers?: Map<string, (args: string, ctx: any) => Promise<void>>;
 	error?: string;
 }

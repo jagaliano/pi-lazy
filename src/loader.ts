@@ -10,6 +10,7 @@ type AnyHandler = (event: any, ctx: ExtensionContext) => any;
 interface LoadTrack {
 	tools: string[];
 	commands: string[];
+	commandHandlers: Map<string, (args: string, ctx: any) => Promise<void>>;
 	sessionStartHandlers: AnyHandler[];
 	resourcesDiscoverHandlers: AnyHandler[];
 }
@@ -327,6 +328,8 @@ function createTrackingApi(pi: ExtensionAPI, track: LoadTrack): ExtensionAPI {
 
 	const registerCommand = (name: string, options: unknown) => {
 		track.commands.push(name);
+		const handler = (options as { handler?: (args: string, ctx: any) => Promise<void> } | null)?.handler;
+		if (typeof handler === "function") track.commandHandlers.set(name, handler);
 		return pi.registerCommand(name, options as any);
 	};
 
@@ -360,6 +363,7 @@ export async function loadResolvedEntry(
 			alreadyLoaded: true,
 			tools: entry.loadedTools,
 			commands: entry.loadedCommands,
+			commandHandlers: entry.loadedCommandHandlers,
 			loadMs: entry.loadMs,
 		};
 	}
@@ -396,6 +400,7 @@ export async function loadResolvedEntry(
 	const track: LoadTrack = {
 		tools: [],
 		commands: [],
+		commandHandlers: new Map(),
 		sessionStartHandlers: [],
 		resourcesDiscoverHandlers: [],
 	};
@@ -452,6 +457,7 @@ export async function loadResolvedEntry(
 		entry.loadMs = loadMs;
 		entry.loadedTools = track.tools;
 		entry.loadedCommands = track.commands;
+		entry.loadedCommandHandlers = track.commandHandlers;
 		entry.error = undefined;
 
 		return {
@@ -460,6 +466,7 @@ export async function loadResolvedEntry(
 			loadMs,
 			tools: track.tools,
 			commands: track.commands,
+			commandHandlers: track.commandHandlers,
 		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
