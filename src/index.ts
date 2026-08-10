@@ -529,10 +529,23 @@ export default function piLazy(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const res = await loadByName(pi, rt, params.name, ctx);
+			// Serialize a safe, structuredClone-friendly details payload. LoadResult
+			// may contain only primitives now, but keeping an explicit allowlist here
+			// means a future non-serializable field can never crash the transcript
+			// (pi structuredClones tool-result `details`).
+			const details = {
+				ok: res.ok,
+				name: res.name,
+				alreadyLoaded: !!res.alreadyLoaded,
+				loadMs: res.loadMs ?? null,
+				tools: res.tools ?? [],
+				commands: res.commands ?? [],
+				error: res.error ?? undefined,
+			};
 			if (!res.ok) {
 				return {
 					content: [{ type: "text", text: `Failed: ${res.error}` }],
-					details: res,
+					details,
 				};
 			}
 			return {
@@ -544,7 +557,7 @@ export default function piLazy(pi: ExtensionAPI) {
 							: `Loaded '${res.name}' in ${res.loadMs ?? "?"}ms. tools=[${(res.tools ?? []).join(", ")}] commands=[${(res.commands ?? []).join(", ")}]`,
 					},
 				],
-				details: res,
+				details,
 			};
 		},
 	});

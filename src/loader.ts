@@ -363,7 +363,10 @@ export async function loadResolvedEntry(
 			alreadyLoaded: true,
 			tools: entry.loadedTools,
 			commands: entry.loadedCommands,
-			commandHandlers: entry.loadedCommandHandlers,
+			// IMPORTANT: LoadResult must stay structuredClone-safe. Never include
+			// commandHandlers (Map<string, Function>) here — pi structuredClones
+			// tool-result `details` for the transcript and functions throw
+			// DataCloneError: "... could not be cloned."
 			loadMs: entry.loadMs,
 		};
 	}
@@ -466,7 +469,10 @@ export async function loadResolvedEntry(
 			loadMs,
 			tools: track.tools,
 			commands: track.commands,
-			commandHandlers: track.commandHandlers,
+			// IMPORTANT: LoadResult must stay structuredClone-safe. Never include
+			// commandHandlers (Map<string, Function>) here — pi structuredClones
+			// tool-result `details` for the transcript and functions throw
+			// DataCloneError: "... could not be cloned."
 		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

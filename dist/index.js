@@ -444,7 +444,10 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
       alreadyLoaded: true,
       tools: entry.loadedTools,
       commands: entry.loadedCommands,
-      commandHandlers: entry.loadedCommandHandlers,
+      // IMPORTANT: LoadResult must stay structuredClone-safe. Never include
+      // commandHandlers (Map<string, Function>) here — pi structuredClones
+      // tool-result `details` for the transcript and functions throw
+      // DataCloneError: "... could not be cloned."
       loadMs: entry.loadMs
     };
   }
@@ -530,8 +533,11 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
       name: spec.name,
       loadMs,
       tools: track.tools,
-      commands: track.commands,
-      commandHandlers: track.commandHandlers
+      commands: track.commands
+      // IMPORTANT: LoadResult must stay structuredClone-safe. Never include
+      // commandHandlers (Map<string, Function>) here — pi structuredClones
+      // tool-result `details` for the transcript and functions throw
+      // DataCloneError: "... could not be cloned."
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -1172,10 +1178,19 @@ function piLazy(pi) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const res = await loadByName(pi, rt, params.name, ctx);
+      const details = {
+        ok: res.ok,
+        name: res.name,
+        alreadyLoaded: !!res.alreadyLoaded,
+        loadMs: res.loadMs ?? null,
+        tools: res.tools ?? [],
+        commands: res.commands ?? [],
+        error: res.error ?? void 0
+      };
       if (!res.ok) {
         return {
           content: [{ type: "text", text: `Failed: ${res.error}` }],
-          details: res
+          details
         };
       }
       return {
@@ -1185,7 +1200,7 @@ function piLazy(pi) {
             text: res.alreadyLoaded ? `'${res.name}' already loaded or eager.` : `Loaded '${res.name}' in ${res.loadMs ?? "?"}ms. tools=[${(res.tools ?? []).join(", ")}] commands=[${(res.commands ?? []).join(", ")}]`
           }
         ],
-        details: res
+        details
       };
     }
   });
