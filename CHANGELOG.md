@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.6
+
+- **Fix DataCloneError on every lazy load** ("`... could not be cloned`"):
+  `loadResolvedEntry` returned `commandHandlers` — a `Map` of command name to
+  handler **function** — inside `LoadResult`, and the `lazy_load` tool
+  forwarded the whole object as tool-result `details`. Pi `structuredClone`s
+  tool-result details for the transcript, and functions cannot be cloned, so
+  every lazy load crashed with `DataCloneError: <handler> could not be
+  cloned.`
+- Remove `commandHandlers` from `LoadResult`. Stub-command dispatch already
+  reads `entry.loadedCommandHandlers` directly, so nothing consumed it from
+  the result; internal `ResolvedEntry` tracking is unchanged.
+- Sanitize `lazy_load` tool `details` to an explicit primitive allowlist
+  (`ok`, `name`, `alreadyLoaded`, `loadMs`, `tools`, `commands`, `error`) as
+  defense in depth, so a future non-serializable field can never crash the
+  transcript.
+
 ## 0.2.5
 
 - Fix stub command re-dispatch: after lazy-loading the real package, invoke its
