@@ -178,14 +178,14 @@ Default is **on** (`"auto": true` in `lazy.json`).
 }
 ```
 
-`/lazy load my-pack` loads `context-mode` first. If a dependency fails, the parent load fails with a clear error.
+`/lazy load my-pack` loads `context-mode` first. If a dependency fails, the parent load fails with a clear error. Dependency cycles are rejected with the complete cycle path, and concurrent requests for the same package share one load.
 
 ## Configuration
 
 Path: **`~/.pi/agent/lazy.json`**
 
 - Auto-created on first run from built-in defaults
-- Reset with `/lazy init` (overwrites the file)
+- Reset with `/lazy init` (backs up the old file, then requires a reload/restart)
 - Show path with `/lazy config`
 
 Full example (also in [`examples/lazy.json`](./examples/lazy.json)):
@@ -353,7 +353,8 @@ error    mcp              on-demand    npm:pi-mcp-adapter — package not instal
 | `pending` | Filtered with `extensions: []`; waiting for a trigger |
 | `loading` | Load in progress |
 | `loaded` | Factory ran successfully this session |
-| `error` | Last load failed (message in the row) |
+| `error` | Last load failed before activation (message in the row; retry is allowed) |
+| `poisoned` | A factory failed after activation began; restart before retrying |
 
 ## LLM tool: `lazy_load`
 
@@ -412,6 +413,8 @@ Manual `/lazy load` and stub `/cmd` / tools still work. Turn back on with `/lazy
 4. Restart Pi
 5. `/lazy load some-name` or use its stubs
 
+Changes to package specs, stubs, shortcuts, or event triggers take effect after `/reload` or a process restart. `/lazy auto on|off` is the only configuration change applied immediately.
+
 ### Undo migrate for one package
 
 Edit `settings.json`: change that entry back to a plain string source (or remove `"extensions": []`), keep `"lazy": false` in `lazy.json`, then restart. Or restore from the `settings.json.bak.lazy-*` backup.
@@ -440,6 +443,7 @@ pi-lazy: run /lazy migrate then restart for true module-lazy
 ## Limits (v1)
 
 - **No mid-session unload** — loaded factories stay until `/reload` / process restart
+- A factory that fails after registering runtime state is marked **poisoned** and cannot be retried until restart
 - **Boot-critical packages** should stay `"lazy": false`
 - **Stub `cmd` / `tools` names must be declared** in the spec
 - **Skills / prompts** stay eager by default — only **extensions** are deferred via `extensions: []`
@@ -452,8 +456,8 @@ pi-lazy: run /lazy migrate then restart for true module-lazy
 git clone https://github.com/Rahularya01/pi-lazy
 cd pi-lazy
 npm install
-npm run typecheck
-npm run build
+npm test
+npm run test:smoke
 
 # run an isolated startup benchmark; never modifies ~/.pi/agent
 BENCH_RUNS=3 node scripts/bench-startup.mjs
@@ -473,11 +477,12 @@ Layout:
 | `src/loader.ts` | Dynamic import / cached jiti setup + factory invoke |
 | `dist/index.js` | Compiled production extension entry |
 | `src/types.ts` | Spec / config types |
+| `test/unit.test.ts` | Hermetic loader, lifecycle, migration, and validation regression tests |
 | `examples/lazy.json` | Example catalog |
 
 ## Publish
 
-CI runs typecheck on every push/PR to `main`.
+CI runs the hermetic test suite, typecheck, build, production dependency audit, and package-content verification on Node 20, 22, and 24.
 
 Releases publish to npm automatically when a version tag is pushed:
 

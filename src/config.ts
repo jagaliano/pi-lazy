@@ -1,4 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { LazyConfig, LazyMode, LazySpec } from "./types.ts";
@@ -126,31 +137,173 @@ function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeStringArray(value: unknown, field: string, issues: string[]): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) {
+		issues.push(`${field} must be an array of strings`);
+		return undefined;
+	}
+	const result: string[] = [];
+	for (const item of value) {
+		if (typeof item !== "string" || item.trim().length === 0) {
+			issues.push(`${field} contains an empty or non-string value`);
+			continue;
+		}
+		const normalized = item.trim();
+		if (!result.includes(normalized)) result.push(normalized);
+	}
+	return result.length > 0 ? result : undefined;
+}
+
+function normalizeSpec(value: unknown, index: number, defaultsLazy: LazyMode, issues: string[]): LazySpec | null {
+	const field = `specs[${index}]`;
+	if (!isRecord(value)) {
+		issues.push(`${field} must be an object`);
+		return null;
+	}
+
+	const name = typeof value.name === "string" ? value.name.trim() : "";
+	const source = typeof value.source === "string" ? value.source.trim() : "";
+	if (!name) issues.push(`${field}.name must be a non-empty string`);
+	if (!source) issues.push(`${field}.source must be a non-empty string`);
+	if (!name || !source) return null;
+
+	const lazy = value.lazy === undefined ? defaultsLazy : normalizeMode(value.lazy, defaultsLazy);
+	if (value.lazy !== undefined && lazy === defaultsLazy && value.lazy !== defaultsLazy) {
+		issues.push(`${field}.lazy must be false, true, or "after-start"`);
+	}
+
+	let priority: number | undefined;
+	if (value.priority !== undefined) {
+		if (typeof value.priority === "number" && Number.isFinite(value.priority) && Number.isInteger(value.priority)) {
+			priority = value.priority;
+		} else {
+			issues.push(`${field}.priority must be a finite integer`);
+		}
+	}
+
+	const description = value.description === undefined || typeof value.description === "string" ? value.description : undefined;
+	if (value.description !== undefined && description === undefined) {
+		issues.push(`${field}.description must be a string`);
+	}
+
+	return {
+		name,
+		source,
+		lazy,
+		...(priority === undefined ? {} : { priority }),
+		...(description === undefined ? {} : { description }),
+		cmd: normalizeStringArray(value.cmd, `${field}.cmd`, issues),
+		tools: normalizeStringArray(value.tools, `${field}.tools`, issues),
+		keys: normalizeStringArray(value.keys, `${field}.keys`, issues),
+		event: normalizeStringArray(value.event, `${field}.event`, issues),
+		keywords: normalizeStringArray(value.keywords, `${field}.keywords`, issues),
+		dependencies: normalizeStringArray(value.dependencies, `${field}.dependencies`, issues),
+	};
+}
+
+function reportConfigIssues(path: string, issues: string[]) {
+	for (const issue of issues) console.error(`[pi-lazy] invalid ${path}: ${issue}`);
+}
+
+/** Write JSON without ever exposing a partially-written target file. */
+export function atomicWriteJson(path: string, value: unknown): void {
+	mkdirSync(dirname(path), { recursive: true });
+	const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+	let fd: number | undefined;
+	try {
+		const mode = existsSync(path) ? statSync(path).mode : 0o600;
+		fd = openSync(tempPath, "wx", mode);
+		writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		renameSync(tempPath, path);
+		try {
+			const dirFd = openSync(dirname(path), "r");
+			try {
+				fsyncSync(dirFd);
+			} finally {
+				closeSync(dirFd);
+			}
+		} catch {
+			// Some platforms do not allow fsync on directories; the rename itself is
+			// still atomic, so durability falls back to the platform default.
+		}
+	} catch (err) {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				/* ignore cleanup failure */
+			}
+		}
+		try {
+			unlinkSync(tempPath);
+		} catch {
+			/* temp file may not exist */
+		}
+		throw err;
+	}
+}
+
 export function loadConfig(agentDir = getAgentDir()): LazyConfig {
 	const path = getLazyConfigPath(agentDir);
 	if (!existsSync(path)) {
 		const cfg = defaultConfig();
-		saveConfig(cfg, agentDir);
+		try {
+			saveConfig(cfg, agentDir);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			console.error(`[pi-lazy] failed to create lazy.json: ${message}`);
+		}
 		return cfg;
 	}
 
 	try {
-		const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<LazyConfig>;
-		const defaultsLazy = normalizeMode(raw.defaults?.lazy, true);
-		const specs = Array.isArray(raw.specs)
-			? raw.specs
-					.filter((s): s is LazySpec => !!s && typeof s === "object" && typeof s.name === "string" && typeof s.source === "string")
-					.map((s) => ({
-						...s,
-						lazy: s.lazy === undefined ? defaultsLazy : normalizeMode(s.lazy, defaultsLazy),
-						cmd: s.cmd?.filter((c) => typeof c === "string" && c.length > 0),
-						tools: s.tools?.filter((t) => typeof t === "string" && t.length > 0),
-						keys: s.keys?.filter((k) => typeof k === "string" && k.length > 0),
-						event: s.event?.filter((e) => typeof e === "string" && e.length > 0),
-						keywords: s.keywords?.filter((k) => typeof k === "string" && k.length > 0),
-						dependencies: s.dependencies?.filter((d) => typeof d === "string" && d.length > 0),
-					}))
-			: defaultConfig().specs;
+		const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+		if (!isRecord(parsed)) throw new Error("root must be a JSON object");
+		const raw = parsed;
+		const issues: string[] = [];
+		const supportedVersion = raw.version === undefined || raw.version === CONFIG_VERSION;
+		if (!supportedVersion) {
+			issues.push(`unsupported version ${String(raw.version)} (expected ${CONFIG_VERSION})`);
+		}
+		const defaults = isRecord(raw.defaults) ? raw.defaults : {};
+		if (raw.defaults !== undefined && !isRecord(raw.defaults)) issues.push("defaults must be an object");
+		const defaultsLazy = normalizeMode(defaults.lazy, true);
+		if (defaults.lazy !== undefined && defaultsLazy === true && defaults.lazy !== true) {
+			issues.push('defaults.lazy must be false, true, or "after-start"');
+		}
+
+		const specs: LazySpec[] = [];
+		const names = new Set<string>();
+		if (!supportedVersion) {
+			issues.push("unsupported configuration is disabled until it is migrated");
+		} else if (!Array.isArray(raw.specs)) {
+			issues.push("specs must be an array; no packages will be managed until it is fixed");
+		} else {
+			for (let i = 0; i < raw.specs.length; i++) {
+				const spec = normalizeSpec(raw.specs[i], i, defaultsLazy, issues);
+				if (!spec) continue;
+				if (names.has(spec.name)) {
+					issues.push(`duplicate spec name '${spec.name}' at specs[${i}]`);
+					continue;
+				}
+				names.add(spec.name);
+				specs.push(spec);
+			}
+		}
+		for (const spec of specs) {
+			for (const dependency of spec.dependencies ?? []) {
+				if (!names.has(dependency)) issues.push(`spec '${spec.name}' references unknown dependency '${dependency}'`);
+			}
+		}
+		reportConfigIssues(path, issues);
 
 		return {
 			version: 1,
@@ -170,9 +323,7 @@ export function loadConfig(agentDir = getAgentDir()): LazyConfig {
 
 export function saveConfig(config: LazyConfig, agentDir = getAgentDir()): string {
 	const path = getLazyConfigPath(agentDir);
-	mkdirSync(dirname(path), { recursive: true });
-	const body = `${JSON.stringify(config, null, 2)}\n`;
-	writeFileSync(path, body, "utf-8");
+	atomicWriteJson(path, config);
 	return path;
 }
 

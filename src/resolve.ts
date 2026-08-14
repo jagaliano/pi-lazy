@@ -1,13 +1,22 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { LazySpec } from "./types.ts";
 
 interface PiManifest {
 	extensions?: string[];
-	skills?: string[];
-	prompts?: string[];
-	themes?: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeIsDirectory(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
 }
 
 export function npmPackageName(source: string): string | null {
@@ -27,6 +36,14 @@ export function npmPackageName(source: string): string | null {
 	return null;
 }
 
+function npmPackageIdentity(source: string): { name: string; selector?: string } | null {
+	const name = npmPackageName(source);
+	if (!name) return null;
+	const rest = source.startsWith("npm:") ? source.slice(4) : source;
+	const selector = rest.slice(name.length);
+	return { name, ...(selector.startsWith("@") && selector.length > 1 ? { selector: selector.slice(1) } : {}) };
+}
+
 export function resolvePackageRoot(source: string, agentDir = getAgentDir(), cwd = process.cwd()): string | null {
 	const npmName = npmPackageName(source);
 	if (npmName) {
@@ -35,7 +52,7 @@ export function resolvePackageRoot(source: string, agentDir = getAgentDir(), cwd
 			join(cwd, ".pi", "npm", "node_modules", npmName),
 		];
 		for (const c of candidates) {
-			if (existsSync(c)) return c;
+			if (safeIsDirectory(c)) return c;
 		}
 		return null;
 	}
@@ -50,9 +67,7 @@ export function resolvePackageRoot(source: string, agentDir = getAgentDir(), cwd
 	}
 
 	const local = resolve(cwd, source);
-	if (existsSync(local)) return local;
-	const abs = resolve(source);
-	if (existsSync(abs)) return abs;
+	if (safeIsDirectory(local)) return local;
 	return null;
 }
 
@@ -60,8 +75,12 @@ function readPiManifest(packageRoot: string): PiManifest | null {
 	const pj = join(packageRoot, "package.json");
 	if (!existsSync(pj)) return null;
 	try {
-		const pkg = JSON.parse(readFileSync(pj, "utf-8")) as { pi?: PiManifest };
-		return pkg.pi && typeof pkg.pi === "object" ? pkg.pi : null;
+		const pkg = JSON.parse(readFileSync(pj, "utf-8")) as unknown;
+		if (!isRecord(pkg) || !isRecord(pkg.pi)) return null;
+		const extensions = Array.isArray(pkg.pi.extensions)
+			? pkg.pi.extensions.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+			: undefined;
+		return { extensions };
 	} catch {
 		return null;
 	}
@@ -80,8 +99,15 @@ export function resolveExtensionEntries(packageRoot: string): string[] {
 		const entries: string[] = [];
 		for (const extPath of manifest.extensions) {
 			const resolved = resolve(packageRoot, extPath);
+			const withinRoot = relative(packageRoot, resolved);
+			if (withinRoot === ".." || withinRoot.startsWith(`..${sep}`) || isAbsolute(withinRoot)) continue;
 			if (!existsSync(resolved)) continue;
-			const st = statSync(resolved);
+			let st;
+			try {
+				st = statSync(resolved);
+			} catch {
+				continue;
+			}
 			if (st.isFile() && isExtensionFile(resolved)) {
 				entries.push(resolved);
 				continue;
@@ -94,9 +120,9 @@ export function resolveExtensionEntries(packageRoot: string): string[] {
 				else {
 					// directory of extension files (e.g. extensions/*.ts)
 					try {
-						for (const name of readdirSync(resolved)) {
-							if (isExtensionFile(name)) {
-								entries.push(join(resolved, name));
+						for (const item of readdirSync(resolved, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+							if (item.isFile() && isExtensionFile(item.name)) {
+								entries.push(join(resolved, item.name));
 							}
 						}
 					} catch {
@@ -128,35 +154,59 @@ export function resolveSpecPaths(spec: LazySpec, agentDir = getAgentDir(), cwd =
 
 /** Detect whether settings has this package with extensions filtered to none. */
 export function isModuleLazyInSettings(source: string, settingsPackages: unknown[]): boolean {
-	const target = normalizeSourceKey(source);
+	const matches: unknown[] = [];
 	for (const entry of settingsPackages) {
 		if (typeof entry === "string") {
-			if (normalizeSourceKey(entry) === target) return false; // fully eager
+			if (sourcesMatch(entry, source)) matches.push(entry);
 			continue;
 		}
 		if (entry && typeof entry === "object") {
 			const obj = entry as { source?: string; extensions?: unknown };
-			if (typeof obj.source === "string" && normalizeSourceKey(obj.source) === target) {
-				return Array.isArray(obj.extensions) && obj.extensions.length === 0;
-			}
+			if (typeof obj.source === "string" && sourcesMatch(obj.source, source)) matches.push(entry);
 		}
 	}
-	return false;
+	if (matches.length !== 1) return false;
+	const match = matches[0];
+	return (
+		!!match
+		&& typeof match === "object"
+		&& Array.isArray((match as { extensions?: unknown }).extensions)
+		&& (match as { extensions: unknown[] }).extensions.length === 0
+	);
 }
 
 export function normalizeSourceKey(source: string): string {
-	const npm = npmPackageName(source);
-	if (npm) return `npm:${npm}`;
-	return source;
+	const trimmed = source.trim();
+	const npm = npmPackageName(trimmed);
+	if (npm) return `npm:${trimmed.startsWith("npm:") ? trimmed.slice(4) : trimmed}`;
+	return trimmed;
+}
+
+function sourcesMatch(left: string, right: string): boolean {
+	const leftNpm = npmPackageIdentity(left);
+	const rightNpm = npmPackageIdentity(right);
+	if (leftNpm || rightNpm) {
+		if (!leftNpm || !rightNpm || leftNpm.name !== rightNpm.name) return false;
+		return !leftNpm.selector || !rightNpm.selector || leftNpm.selector === rightNpm.selector;
+	}
+	return normalizeSourceKey(left) === normalizeSourceKey(right);
 }
 
 export function findSettingsPackageIndex(settingsPackages: unknown[], source: string): number {
-	const target = normalizeSourceKey(source);
-	return settingsPackages.findIndex((entry) => {
-		if (typeof entry === "string") return normalizeSourceKey(entry) === target;
-		if (entry && typeof entry === "object" && typeof (entry as { source?: string }).source === "string") {
-			return normalizeSourceKey((entry as { source: string }).source) === target;
+	return findSettingsPackageIndices(settingsPackages, source)[0] ?? -1;
+}
+
+export function findSettingsPackageIndices(settingsPackages: unknown[], source: string): number[] {
+	const indices: number[] = [];
+	settingsPackages.forEach((entry, index) => {
+		if (typeof entry === "string") {
+			if (sourcesMatch(entry, source)) indices.push(index);
+			return;
 		}
-		return false;
+		if (entry && typeof entry === "object" && typeof (entry as { source?: string }).source === "string") {
+			if (sourcesMatch((entry as { source: string }).source, source)) indices.push(index);
+			return;
+		}
 	});
+	return indices;
 }

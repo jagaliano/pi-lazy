@@ -17,7 +17,7 @@ import { migrateSettings } from "./migrate.ts";
 import { isModuleLazyInSettings, resolveSpecPaths } from "./resolve.ts";
 import { performance } from "node:perf_hooks";
 import type { LazyConfig, LoadResult, ResolvedEntry } from "./types.ts";
-import { existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { getSettingsPath } from "./config.ts";
 
 interface Runtime {
@@ -29,6 +29,8 @@ interface Runtime {
 	status: string;
 	profile: Array<{ label: string; ms: number }>;
 	queueCancelled: boolean;
+	sessionGeneration: number;
+	restartRequired: boolean;
 }
 
 function readSettingsPackages(agentDir: string): unknown[] {
@@ -42,7 +44,7 @@ function readSettingsPackages(agentDir: string): unknown[] {
 	}
 }
 
-function buildCatalog(config: LazyConfig, agentDir: string, cwd: string): Map<string, ResolvedEntry> {
+function buildCatalog(config: LazyConfig, agentDir: string): Map<string, ResolvedEntry> {
 	const packages = readSettingsPackages(agentDir);
 	const map = new Map<string, ResolvedEntry>();
 
@@ -67,6 +69,7 @@ function buildCatalog(config: LazyConfig, agentDir: string, cwd: string): Map<st
 			extensionPaths: [],
 			moduleLazyReady,
 			state,
+			normalizedKeywords: (spec.keywords ?? []).map((keyword) => keyword.toLowerCase()),
 		});
 	}
 
@@ -78,9 +81,10 @@ function formatStatus(rt: Runtime): string {
 	const loaded = all.filter((e) => e.state === "loaded").length;
 	const pending = all.filter((e) => e.state === "pending").length;
 	const eager = all.filter((e) => e.state === "eager").length;
-	const errors = all.filter((e) => e.state === "error").length;
+	const errors = all.filter((e) => e.state === "error" || e.state === "poisoned").length;
 	const parts = [`lazy ${loaded}↑`, `${pending}·`, `${eager}⚡`];
 	if (errors) parts.push(`${errors}✗`);
+	if (rt.restartRequired) parts.push("restart required");
 	return parts.join(" ");
 }
 
@@ -119,12 +123,19 @@ function recordTiming(rt: Runtime, label: string, started: number) {
 	if (rt.profile.length > 100) rt.profile.shift();
 }
 
-async function loadByName(pi: ExtensionAPI, rt: Runtime, name: string, ctx?: ExtensionContext): Promise<LoadResult> {
+async function loadByName(
+	pi: ExtensionAPI,
+	rt: Runtime,
+	name: string,
+	ctx?: ExtensionContext,
+	ancestry: string[] = [],
+): Promise<LoadResult> {
 	const key = name.trim();
+	if (!key) return { ok: false, name: key, error: "spec name must not be empty" };
 	const entry =
 		rt.entries.get(key) ??
 		[...rt.entries.values()].find(
-			(e) => e.spec.source === key || e.spec.source.endsWith(key) || e.spec.name.toLowerCase() === key.toLowerCase(),
+			(e) => e.spec.source === key || e.spec.name.toLowerCase() === key.toLowerCase(),
 		);
 
 	if (!entry) {
@@ -144,15 +155,23 @@ async function loadByName(pi: ExtensionAPI, rt: Runtime, name: string, ctx?: Ext
 	// Resolve package metadata only on first actual load, not during startup catalog creation.
 	if (!entry.packageRoot && entry.extensionPaths.length === 0) {
 		const started = performance.now();
-		const resolved = resolveSpecPaths(entry.spec, getAgentDir(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
-		entry.packageRoot = resolved.packageRoot ?? "";
-		entry.extensionPaths = resolved.extensionPaths;
-		entry.resolveMs = performance.now() - started;
-		recordTiming(rt, `resolve:${entry.spec.name}`, started);
+		try {
+			const resolved = resolveSpecPaths(entry.spec, getAgentDir(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
+			entry.packageRoot = resolved.packageRoot ?? "";
+			entry.extensionPaths = resolved.extensionPaths;
+			entry.resolveMs = performance.now() - started;
+			recordTiming(rt, `resolve:${entry.spec.name}`, started);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			entry.state = "error";
+			entry.error = `failed to resolve ${entry.spec.source}: ${message}`;
+			return { ok: false, name: entry.spec.name, error: entry.error };
+		}
 	}
 	const started = performance.now();
 	const result = await loadResolvedEntry(entry, pi, ctx ?? rt.sessionCtx, {
-		loadDependency: (dep) => loadByName(pi, rt, dep, ctx),
+		ancestry,
+		loadDependency: (dep, nextAncestry) => loadByName(pi, rt, dep, ctx, nextAncestry),
 	});
 	recordTiming(rt, `load:${entry.spec.name}`, started);
 
@@ -168,11 +187,17 @@ function registerStubs(pi: ExtensionAPI, rt: Runtime) {
 		if (entry.state !== "pending") continue;
 		const { spec } = entry;
 		for (const cmd of spec.cmd ?? []) {
-			if (cmdOwners.has(cmd)) continue;
+			if (cmdOwners.has(cmd)) {
+				console.error(`[pi-lazy] command stub '${cmd}' is claimed by both '${cmdOwners.get(cmd)}' and '${spec.name}'`);
+				continue;
+			}
 			cmdOwners.set(cmd, spec.name);
 		}
 		for (const tool of spec.tools ?? []) {
-			if (toolOwners.has(tool)) continue;
+			if (toolOwners.has(tool)) {
+				console.error(`[pi-lazy] tool stub '${tool}' is claimed by both '${toolOwners.get(tool)}' and '${spec.name}'`);
+				continue;
+			}
 			toolOwners.set(tool, spec.name);
 		}
 		for (const key of spec.keys ?? []) {
@@ -219,11 +244,11 @@ function registerStubs(pi: ExtensionAPI, rt: Runtime) {
 					await real(args, ctx);
 					return;
 				}
-				// Fallback: package didn't register this exact command name
-				// (e.g. it renamed/aliased it internally). Best effort re-dispatch.
-				const suffix = args?.trim() ? ` ${args.trim()}` : "";
-				pi.sendUserMessage(`/${cmd}${suffix}`, { deliverAs: "followUp" });
-			},
+					ctx.ui.notify(
+						`lazy: '${owner}' loaded but did not register /${cmd}; update lazy.json to the package's actual command name`,
+						"error",
+					);
+				},
 		});
 	}
 
@@ -271,7 +296,21 @@ function registerEventTriggers(pi: ExtensionAPI, rt: Runtime) {
 		}
 	}
 
-	// before_agent_start: keywords + explicit event
+	const loadTriggered = async (names: Iterable<string>, ctx: ExtensionContext) => {
+		const limit = rt.config.autoLoadLimit ?? 1;
+		let loaded = 0;
+		for (const name of new Set(names)) {
+			if (loaded >= limit) break;
+			const current = rt.sessionCtx ?? ctx;
+			const res = await loadByName(pi, rt, name, current);
+			if (res.ok && !res.alreadyLoaded) {
+				loaded++;
+				notifySafe(rt.sessionCtx ?? current, `lazy: auto-loaded ${name}`, "info");
+			}
+		}
+	};
+
+	// before_agent_start combines explicit event owners with keyword matches.
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!rt.auto) return;
 		const prompt = (event.prompt ?? "").toLowerCase();
@@ -283,47 +322,51 @@ function registerEventTriggers(pi: ExtensionAPI, rt: Runtime) {
 
 		for (const entry of rt.entries.values()) {
 			if (entry.state !== "pending") continue;
-			for (const kw of entry.spec.keywords ?? []) {
-				if (kw && prompt.includes(kw.toLowerCase())) {
+			for (const keyword of entry.normalizedKeywords ?? []) {
+				if (prompt.includes(keyword)) {
 					toLoad.add(entry.spec.name);
 					break;
 				}
 			}
 		}
 
-		const limit = rt.config.autoLoadLimit ?? 1;
-		for (const name of [...toLoad].slice(0, limit)) {
-			// Re-derive ctx after each await: the session can be replaced/reloaded
-			// mid-loop, which would make the closed-over `ctx` stale.
-			const current = rt.sessionCtx ?? ctx;
-			const res = await loadByName(pi, rt, name, current);
-			if (res.ok && !res.alreadyLoaded) {
-				notifySafe(rt.sessionCtx ?? current, `lazy: auto-loaded ${name}`, "info");
-			}
-		}
+		await loadTriggered(toLoad, ctx);
 	});
+
+	for (const [eventName, owners] of eventMap) {
+		if (eventName === "before_agent_start") continue;
+		try {
+			(pi.on as Function)(eventName, async (_event: unknown, ctx: ExtensionContext) => {
+				if (rt.auto) await loadTriggered(owners, ctx);
+			});
+		} catch (err) {
+			console.error(`[pi-lazy] unsupported event trigger '${eventName}': ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
 }
 
-async function runAfterStart(pi: ExtensionAPI, rt: Runtime, ctx: ExtensionContext) {
+async function runAfterStart(pi: ExtensionAPI, rt: Runtime, ctx: ExtensionContext, generation: number) {
 	const queue = [...rt.entries.values()]
 		.filter((e) => e.state === "pending" && e.spec.lazy === "after-start")
 		.sort((a, b) => (a.spec.priority ?? 100) - (b.spec.priority ?? 100));
 
 	const batchSize = rt.config.afterStartBatchSize ?? 1;
 	const delayMs = rt.config.afterStartDelayMs ?? 0;
-	for (let i = 0; i < queue.length && !rt.queueCancelled; i += batchSize) {
+	for (let i = 0; i < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration; i += batchSize) {
 		for (const entry of queue.slice(i, i + batchSize)) {
+			if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
 			// The ctx passed in was captured by session_start before the
 			// setTimeout(0) that scheduled this call; if the session was
 			// replaced/reloaded in that gap (or between iterations here),
 			// rt.sessionCtx already points at the fresh one.
 			const current = rt.sessionCtx ?? ctx;
 			const res = await loadByName(pi, rt, entry.spec.name, current);
+			if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
 			if (!res.ok) {
 				notifySafe(rt.sessionCtx ?? current, `lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
 			}
 		}
-		if (i + batchSize < queue.length && !rt.queueCancelled) {
+		if (i + batchSize < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration) {
 			await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 		}
 	}
@@ -332,7 +375,7 @@ async function runAfterStart(pi: ExtensionAPI, rt: Runtime, ctx: ExtensionContex
 
 function listLines(rt: Runtime): string[] {
 	const lines: string[] = [];
-	const order = ["pending", "loading", "loaded", "error", "eager"] as const;
+	const order = ["pending", "loading", "loaded", "error", "poisoned", "eager"] as const;
 	const sorted = [...rt.entries.values()].sort((a, b) => {
 		const ai = order.indexOf(a.state as (typeof order)[number]);
 		const bi = order.indexOf(b.state as (typeof order)[number]);
@@ -350,39 +393,29 @@ function listLines(rt: Runtime): string[] {
 	return lines;
 }
 
-export default function piLazy(pi: ExtensionAPI) {
-	const agentDir = getAgentDir();
+export function createPiLazy(pi: ExtensionAPI, agentDir = getAgentDir()) {
 	const config = loadConfig(agentDir);
+	const catalogStarted = performance.now();
 	const rt: Runtime = {
 		config,
-		entries: new Map(),
+		entries: buildCatalog(config, agentDir),
 		auto: config.auto !== false,
 		afterStartQueued: false,
 		status: "lazy …",
 		profile: [],
 		queueCancelled: false,
+		sessionGeneration: 0,
+		restartRequired: false,
 	};
-
-	// Catalog is rebuilt on session_start with cwd
-	const rebuild = (cwd: string) => {
-		const started = performance.now();
-		rt.config = loadConfig(agentDir);
-		rt.auto = rt.config.auto !== false;
-		rt.entries = buildCatalog(rt.config, agentDir, cwd);
-		rt.status = formatStatus(rt);
-		recordTiming(rt, "catalog", started);
-	};
-
-	rebuild(process.cwd());
+	recordTiming(rt, "catalog", catalogStarted);
 	registerStubs(pi, rt);
 	registerEventTriggers(pi, rt);
 
 	pi.on("session_start", async (event, ctx) => {
+		rt.sessionGeneration++;
+		const generation = rt.sessionGeneration;
 		rt.sessionCtx = ctx;
 		rt.queueCancelled = false;
-		rebuild(ctx.cwd);
-		// Re-register stubs only for still-pending entries — commands/tools already registered
-		// at factory time stay; new pending set is fine for this session.
 		refreshStatus(pi, rt, ctx);
 
 		const needsMigrate = [...rt.entries.values()].some(
@@ -392,16 +425,24 @@ export default function piLazy(pi: ExtensionAPI) {
 			ctx.ui.notify("pi-lazy: run /lazy migrate then restart for true module-lazy", "info");
 		}
 
-		if (!rt.afterStartQueued) {
-			rt.afterStartQueued = true;
-			// VeryLazy: yield so first paint / prompt isn't blocked
-			setTimeout(() => {
-				void runAfterStart(pi, rt, ctx);
-			}, 0);
-		}
+		rt.afterStartQueued = true;
+		// VeryLazy: yield so first paint / prompt isn't blocked. A generation token
+		// makes older scheduled work harmless if sessions change in the meantime.
+		setTimeout(() => {
+			void runAfterStart(pi, rt, ctx, generation)
+				.catch((err) => {
+					const message = err instanceof Error ? err.message : String(err);
+					console.error(`[pi-lazy] after-start queue failed: ${message}`);
+					notifySafe(rt.sessionCtx, `lazy: after-start queue failed: ${message}`, "warning");
+				})
+				.finally(() => {
+					if (generation === rt.sessionGeneration) rt.afterStartQueued = false;
+				});
+		}, 0);
 	});
 
 	pi.on("session_shutdown", () => {
+		rt.sessionGeneration++;
 		rt.sessionCtx = undefined;
 		rt.afterStartQueued = false;
 		rt.queueCancelled = true;
@@ -452,19 +493,38 @@ export default function piLazy(pi: ExtensionAPI) {
 			}
 
 			if (sub === "init") {
-				const path = saveConfig(defaultConfig(), agentDir);
-				rebuild(ctx.cwd);
-				ctx.ui.notify(`wrote default config → ${path}`, "info");
+				try {
+					const currentPath = getLazyConfigPath(agentDir);
+					let backup = "";
+					if (existsSync(currentPath)) {
+						const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+						backup = `${currentPath}.bak.init-${stamp}`;
+						copyFileSync(currentPath, backup);
+					}
+					const path = saveConfig(defaultConfig(), agentDir);
+					rt.restartRequired = true;
+					refreshStatus(pi, rt, ctx);
+					ctx.ui.notify(`wrote default config → ${path}${backup ? `\nbackup: ${backup}` : ""}\nReload or restart Pi to apply it.`, "info");
+				} catch (err) {
+					ctx.ui.notify(`failed to initialize config: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
 				return;
 			}
 
 			if (sub === "auto") {
 				const mode = (rest[0] ?? "").toLowerCase();
 				if (mode === "on" || mode === "off") {
-					rt.auto = mode === "on";
-					rt.config.auto = rt.auto;
-					saveConfig(rt.config, agentDir);
-					ctx.ui.notify(`lazy auto ${mode}`, "info");
+					const previous = rt.auto;
+					try {
+						rt.auto = mode === "on";
+						rt.config.auto = rt.auto;
+						saveConfig(rt.config, agentDir);
+						ctx.ui.notify(`lazy auto ${mode}`, "info");
+					} catch (err) {
+						rt.auto = previous;
+						rt.config.auto = previous;
+						ctx.ui.notify(`failed to save config: ${err instanceof Error ? err.message : String(err)}`, "error");
+					}
 					return;
 				}
 				ctx.ui.notify(`lazy auto is ${rt.auto ? "on" : "off"} (usage: /lazy auto on|off)`, "info");
@@ -485,7 +545,7 @@ export default function piLazy(pi: ExtensionAPI) {
 					"Restart pi to apply module-lazy (extensions filtered to []).",
 				].filter(Boolean);
 				ctx.ui.notify(lines.join("\n"), "info");
-				rebuild(ctx.cwd);
+				if (result.changed.length > 0) rt.restartRequired = true;
 				refreshStatus(pi, rt, ctx);
 				return;
 			}
@@ -561,4 +621,8 @@ export default function piLazy(pi: ExtensionAPI) {
 			};
 		},
 	});
+}
+
+export default function piLazy(pi: ExtensionAPI) {
+	return createPiLazy(pi, getAgentDir());
 }

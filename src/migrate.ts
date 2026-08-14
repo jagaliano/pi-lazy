@@ -1,7 +1,7 @@
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { getSettingsPath, isManagedLazy, loadConfig } from "./config.ts";
-import { findSettingsPackageIndex } from "./resolve.ts";
+import { atomicWriteJson, getSettingsPath, isManagedLazy, loadConfig } from "./config.ts";
+import { findSettingsPackageIndex, findSettingsPackageIndices } from "./resolve.ts";
 import type { LazySpec } from "./types.ts";
 
 export interface MigrateResult {
@@ -44,7 +44,11 @@ export function migrateSettings(agentDir = getAgentDir()): MigrateResult {
 
 	let settings: Record<string, unknown>;
 	try {
-		settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+		const parsed = JSON.parse(readFileSync(settingsPath, "utf-8")) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("settings.json root must be an object");
+		}
+		settings = parsed as Record<string, unknown>;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return { ok: false, settingsPath, changed: [], skipped: [], added: [], error: message };
@@ -54,6 +58,19 @@ export function migrateSettings(agentDir = getAgentDir()): MigrateResult {
 	const changed: string[] = [];
 	const skipped: string[] = [];
 	const added: string[] = [];
+	for (const spec of config.specs) {
+		const matches = findSettingsPackageIndices(packages, spec.source);
+		if (matches.length > 1) {
+			return {
+				ok: false,
+				settingsPath,
+				changed,
+				skipped,
+				added,
+				error: `duplicate settings.packages entries for ${spec.source} at indices ${matches.join(", ")}`,
+			};
+		}
+	}
 
 	for (const spec of managed) {
 		const source = packageSource(spec);
@@ -101,13 +118,9 @@ export function migrateSettings(agentDir = getAgentDir()): MigrateResult {
 			continue;
 		}
 
-		const otherFilters = Object.entries(obj).some(([k, v]) => {
-			if (k === "source" || k === "extensions") return false;
-			return Array.isArray(v) && v.length > 0;
-		});
-		if (otherFilters) continue;
-
-		packages[idx] = obj.source;
+		const restored = { ...obj };
+		delete restored.extensions;
+		packages[idx] = Object.keys(restored).length === 1 ? restored.source : restored;
 		changed.push(`${spec.name} (restored eager)`);
 	}
 
@@ -117,10 +130,13 @@ export function migrateSettings(agentDir = getAgentDir()): MigrateResult {
 
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 	const backupPath = `${settingsPath}.bak.lazy-${stamp}`;
-	copyFileSync(settingsPath, backupPath);
-
-	settings.packages = packages;
-	writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
-
-	return { ok: true, backupPath, settingsPath, changed, skipped, added };
+	try {
+		copyFileSync(settingsPath, backupPath);
+		settings.packages = packages;
+		atomicWriteJson(settingsPath, settings);
+		return { ok: true, backupPath, settingsPath, changed, skipped, added };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return { ok: false, backupPath, settingsPath, changed, skipped, added, error: message };
+	}
 }

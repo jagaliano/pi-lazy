@@ -3,9 +3,21 @@ import { Type } from "typebox";
 import { getAgentDir as getAgentDir4 } from "@earendil-works/pi-coding-agent";
 
 // src/config.ts
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+var CONFIG_VERSION = 1;
 function getLazyConfigPath(agentDir = getAgentDir()) {
   return join(agentDir, "lazy.json");
 }
@@ -119,26 +131,157 @@ function normalizePositiveInteger(value, fallback) {
 function normalizeNonNegativeInteger(value, fallback) {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
 }
+function isRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function normalizeStringArray(value, field, issues) {
+  if (value === void 0) return void 0;
+  if (!Array.isArray(value)) {
+    issues.push(`${field} must be an array of strings`);
+    return void 0;
+  }
+  const result = [];
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      issues.push(`${field} contains an empty or non-string value`);
+      continue;
+    }
+    const normalized = item.trim();
+    if (!result.includes(normalized)) result.push(normalized);
+  }
+  return result.length > 0 ? result : void 0;
+}
+function normalizeSpec(value, index, defaultsLazy, issues) {
+  const field = `specs[${index}]`;
+  if (!isRecord(value)) {
+    issues.push(`${field} must be an object`);
+    return null;
+  }
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  const source = typeof value.source === "string" ? value.source.trim() : "";
+  if (!name) issues.push(`${field}.name must be a non-empty string`);
+  if (!source) issues.push(`${field}.source must be a non-empty string`);
+  if (!name || !source) return null;
+  const lazy = value.lazy === void 0 ? defaultsLazy : normalizeMode(value.lazy, defaultsLazy);
+  if (value.lazy !== void 0 && lazy === defaultsLazy && value.lazy !== defaultsLazy) {
+    issues.push(`${field}.lazy must be false, true, or "after-start"`);
+  }
+  let priority;
+  if (value.priority !== void 0) {
+    if (typeof value.priority === "number" && Number.isFinite(value.priority) && Number.isInteger(value.priority)) {
+      priority = value.priority;
+    } else {
+      issues.push(`${field}.priority must be a finite integer`);
+    }
+  }
+  const description = value.description === void 0 || typeof value.description === "string" ? value.description : void 0;
+  if (value.description !== void 0 && description === void 0) {
+    issues.push(`${field}.description must be a string`);
+  }
+  return {
+    name,
+    source,
+    lazy,
+    ...priority === void 0 ? {} : { priority },
+    ...description === void 0 ? {} : { description },
+    cmd: normalizeStringArray(value.cmd, `${field}.cmd`, issues),
+    tools: normalizeStringArray(value.tools, `${field}.tools`, issues),
+    keys: normalizeStringArray(value.keys, `${field}.keys`, issues),
+    event: normalizeStringArray(value.event, `${field}.event`, issues),
+    keywords: normalizeStringArray(value.keywords, `${field}.keywords`, issues),
+    dependencies: normalizeStringArray(value.dependencies, `${field}.dependencies`, issues)
+  };
+}
+function reportConfigIssues(path, issues) {
+  for (const issue of issues) console.error(`[pi-lazy] invalid ${path}: ${issue}`);
+}
+function atomicWriteJson(path, value) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  let fd;
+  try {
+    const mode = existsSync(path) ? statSync(path).mode : 384;
+    fd = openSync(tempPath, "wx", mode);
+    writeFileSync(fd, `${JSON.stringify(value, null, 2)}
+`, "utf-8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = void 0;
+    renameSync(tempPath, path);
+    try {
+      const dirFd = openSync(dirname(path), "r");
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch {
+    }
+  } catch (err) {
+    if (fd !== void 0) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+    try {
+      unlinkSync(tempPath);
+    } catch {
+    }
+    throw err;
+  }
+}
 function loadConfig(agentDir = getAgentDir()) {
   const path = getLazyConfigPath(agentDir);
   if (!existsSync(path)) {
     const cfg = defaultConfig();
-    saveConfig(cfg, agentDir);
+    try {
+      saveConfig(cfg, agentDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[pi-lazy] failed to create lazy.json: ${message}`);
+    }
     return cfg;
   }
   try {
-    const raw = JSON.parse(readFileSync(path, "utf-8"));
-    const defaultsLazy = normalizeMode(raw.defaults?.lazy, true);
-    const specs = Array.isArray(raw.specs) ? raw.specs.filter((s) => !!s && typeof s === "object" && typeof s.name === "string" && typeof s.source === "string").map((s) => ({
-      ...s,
-      lazy: s.lazy === void 0 ? defaultsLazy : normalizeMode(s.lazy, defaultsLazy),
-      cmd: s.cmd?.filter((c) => typeof c === "string" && c.length > 0),
-      tools: s.tools?.filter((t) => typeof t === "string" && t.length > 0),
-      keys: s.keys?.filter((k) => typeof k === "string" && k.length > 0),
-      event: s.event?.filter((e) => typeof e === "string" && e.length > 0),
-      keywords: s.keywords?.filter((k) => typeof k === "string" && k.length > 0),
-      dependencies: s.dependencies?.filter((d) => typeof d === "string" && d.length > 0)
-    })) : defaultConfig().specs;
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    if (!isRecord(parsed)) throw new Error("root must be a JSON object");
+    const raw = parsed;
+    const issues = [];
+    const supportedVersion = raw.version === void 0 || raw.version === CONFIG_VERSION;
+    if (!supportedVersion) {
+      issues.push(`unsupported version ${String(raw.version)} (expected ${CONFIG_VERSION})`);
+    }
+    const defaults = isRecord(raw.defaults) ? raw.defaults : {};
+    if (raw.defaults !== void 0 && !isRecord(raw.defaults)) issues.push("defaults must be an object");
+    const defaultsLazy = normalizeMode(defaults.lazy, true);
+    if (defaults.lazy !== void 0 && defaultsLazy === true && defaults.lazy !== true) {
+      issues.push('defaults.lazy must be false, true, or "after-start"');
+    }
+    const specs = [];
+    const names = /* @__PURE__ */ new Set();
+    if (!supportedVersion) {
+      issues.push("unsupported configuration is disabled until it is migrated");
+    } else if (!Array.isArray(raw.specs)) {
+      issues.push("specs must be an array; no packages will be managed until it is fixed");
+    } else {
+      for (let i = 0; i < raw.specs.length; i++) {
+        const spec = normalizeSpec(raw.specs[i], i, defaultsLazy, issues);
+        if (!spec) continue;
+        if (names.has(spec.name)) {
+          issues.push(`duplicate spec name '${spec.name}' at specs[${i}]`);
+          continue;
+        }
+        names.add(spec.name);
+        specs.push(spec);
+      }
+    }
+    for (const spec of specs) {
+      for (const dependency of spec.dependencies ?? []) {
+        if (!names.has(dependency)) issues.push(`spec '${spec.name}' references unknown dependency '${dependency}'`);
+      }
+    }
+    reportConfigIssues(path, issues);
     return {
       version: 1,
       defaults: { lazy: defaultsLazy },
@@ -156,10 +299,7 @@ function loadConfig(agentDir = getAgentDir()) {
 }
 function saveConfig(config, agentDir = getAgentDir()) {
   const path = getLazyConfigPath(agentDir);
-  mkdirSync(dirname(path), { recursive: true });
-  const body = `${JSON.stringify(config, null, 2)}
-`;
-  writeFileSync(path, body, "utf-8");
+  atomicWriteJson(path, config);
   return path;
 }
 function isManagedLazy(spec) {
@@ -280,7 +420,17 @@ async function importFactory(extensionPath) {
       const mod = await import(fileUrl(extensionPath));
       const factory = asFactory(mod);
       if (factory) return factory;
-    } catch {
+    } catch (err) {
+      const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
+      if (!(err instanceof SyntaxError) && ![
+        "ERR_MODULE_NOT_FOUND",
+        "ERR_PACKAGE_PATH_NOT_EXPORTED",
+        "ERR_UNKNOWN_FILE_EXTENSION"
+      ].includes(code)) {
+        throw new Error(`Failed to import extension module ${extensionPath}: ${err instanceof Error ? err.message : String(err)}`, {
+          cause: err
+        });
+      }
     }
   }
   const createJiti = resolveJitiCreate();
@@ -314,7 +464,7 @@ async function importFactory(extensionPath) {
     throw new Error("jiti instance missing async import()");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to import extension module ${extensionPath}: ${message}`);
+    throw new Error(`Failed to import extension module ${extensionPath}: ${message}`, { cause: err });
   }
 }
 function tryResolveFrom(fromPkgJson, spec) {
@@ -437,6 +587,14 @@ function createTrackingApi(pi, track) {
 }
 async function loadResolvedEntry(entry, pi, ctx, deps) {
   const { spec } = entry;
+  const ancestry = deps.ancestry ?? [];
+  if (ancestry.includes(spec.name)) {
+    return {
+      ok: false,
+      name: spec.name,
+      error: `dependency cycle: ${[...ancestry, spec.name].join(" -> ")}`
+    };
+  }
   if (entry.state === "loaded") {
     return {
       ok: true,
@@ -451,6 +609,10 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
       loadMs: entry.loadMs
     };
   }
+  if (entry.state === "poisoned") {
+    return { ok: false, name: spec.name, error: entry.error ?? "partial activation failed \u2014 restart required" };
+  }
+  if (entry.loadPromise) return entry.loadPromise;
   if (entry.state === "loading") {
     return { ok: false, name: spec.name, error: "already loading" };
   }
@@ -468,93 +630,115 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
       error: entry.packageRoot ? "no extension entrypoints found in package" : `package not installed for ${spec.source}`
     };
   }
-  for (const dep of spec.dependencies ?? []) {
-    const depResult = await deps.loadDependency(dep);
-    if (!depResult.ok && !depResult.alreadyLoaded) {
-      return { ok: false, name: spec.name, error: `dependency ${dep} failed: ${depResult.error}` };
-    }
-  }
   entry.state = "loading";
-  const started = Date.now();
-  const track = {
-    tools: [],
-    commands: [],
-    commandHandlers: /* @__PURE__ */ new Map(),
-    sessionStartHandlers: [],
-    resourcesDiscoverHandlers: []
-  };
-  const api = createTrackingApi(pi, track);
-  try {
-    for (const extPath of entry.extensionPaths) {
-      const factory = await importFactory(extPath);
-      if (!factory) {
-        throw new Error(`Extension does not export a default factory: ${extPath}`);
-      }
-      await factory(api);
-    }
-    if (ctx && track.sessionStartHandlers.length > 0) {
-      const event = { type: "session_start", reason: "startup" };
-      for (const handler of track.sessionStartHandlers) {
-        try {
-          await handler(event, ctx);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error(`[pi-lazy] session_start handler error in ${spec.name}: ${message}`);
+  const loadPromise = (async () => {
+    const started = Date.now();
+    const track = {
+      tools: [],
+      commands: [],
+      commandHandlers: /* @__PURE__ */ new Map(),
+      sessionStartHandlers: [],
+      resourcesDiscoverHandlers: []
+    };
+    const api = createTrackingApi(pi, track);
+    let activationStarted = false;
+    try {
+      for (const dep of spec.dependencies ?? []) {
+        const depResult = await deps.loadDependency(dep, [...ancestry, spec.name]);
+        if (!depResult.ok && !depResult.alreadyLoaded) {
+          throw new Error(`dependency ${dep} failed: ${depResult.error}`);
         }
       }
-    }
-    if (ctx && track.resourcesDiscoverHandlers.length > 0) {
-      const event = { type: "resources_discover", cwd: ctx.cwd, reason: "startup" };
-      for (const handler of track.resourcesDiscoverHandlers) {
+      const factories = [];
+      for (const extPath of entry.extensionPaths) {
+        const factory = await importFactory(extPath);
+        if (!factory) throw new Error(`Extension does not export a default factory: ${extPath}`);
+        factories.push(factory);
+      }
+      for (const factory of factories) {
+        activationStarted = true;
+        await factory(api);
+      }
+      if (ctx && track.sessionStartHandlers.length > 0) {
+        const event = { type: "session_start", reason: "startup" };
+        for (const handler of track.sessionStartHandlers) {
+          try {
+            await handler(event, ctx);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error(`[pi-lazy] session_start handler error in ${spec.name}: ${message}`);
+          }
+        }
+      }
+      if (ctx && track.resourcesDiscoverHandlers.length > 0) {
+        const event = { type: "resources_discover", cwd: ctx.cwd, reason: "startup" };
+        for (const handler of track.resourcesDiscoverHandlers) {
+          try {
+            await handler(event, ctx);
+          } catch {
+          }
+        }
+      }
+      if (track.tools.length > 0 && typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
         try {
-          await handler(event, ctx);
+          const active = pi.getActiveTools();
+          const merged = [.../* @__PURE__ */ new Set([...active, ...track.tools])];
+          pi.setActiveTools(merged);
         } catch {
         }
       }
+      const loadMs = Date.now() - started;
+      entry.state = "loaded";
+      entry.loadedAt = Date.now();
+      entry.loadMs = loadMs;
+      entry.loadedTools = [...new Set(track.tools)];
+      entry.loadedCommands = [...new Set(track.commands)];
+      entry.loadedCommandHandlers = track.commandHandlers;
+      entry.error = void 0;
+      return {
+        ok: true,
+        name: spec.name,
+        loadMs,
+        tools: entry.loadedTools,
+        commands: entry.loadedCommands
+        // IMPORTANT: LoadResult must stay structuredClone-safe. Never include
+        // commandHandlers (Map<string, Function>) here — pi structuredClones
+        // tool-result `details` for the transcript and functions throw
+        // DataCloneError: "... could not be cloned."
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      entry.state = activationStarted ? "poisoned" : "error";
+      entry.error = activationStarted ? `${message} (partial activation may have occurred \u2014 restart required)` : message;
+      return { ok: false, name: spec.name, error: entry.error };
     }
-    if (track.tools.length > 0 && typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
-      try {
-        const active = pi.getActiveTools();
-        const merged = [.../* @__PURE__ */ new Set([...active, ...track.tools])];
-        pi.setActiveTools(merged);
-      } catch {
-      }
-    }
-    const loadMs = Date.now() - started;
-    entry.state = "loaded";
-    entry.loadedAt = Date.now();
-    entry.loadMs = loadMs;
-    entry.loadedTools = track.tools;
-    entry.loadedCommands = track.commands;
-    entry.loadedCommandHandlers = track.commandHandlers;
-    entry.error = void 0;
-    return {
-      ok: true,
-      name: spec.name,
-      loadMs,
-      tools: track.tools,
-      commands: track.commands
-      // IMPORTANT: LoadResult must stay structuredClone-safe. Never include
-      // commandHandlers (Map<string, Function>) here — pi structuredClones
-      // tool-result `details` for the transcript and functions throw
-      // DataCloneError: "... could not be cloned."
-    };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    entry.state = "error";
-    entry.error = message;
-    return { ok: false, name: spec.name, error: message };
+  })();
+  entry.loadPromise = loadPromise;
+  try {
+    return await loadPromise;
+  } finally {
+    entry.loadPromise = void 0;
   }
 }
 
 // src/migrate.ts
-import { copyFileSync, existsSync as existsSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2 } from "node:fs";
+import { copyFileSync, existsSync as existsSync4, readFileSync as readFileSync4 } from "node:fs";
 import { getAgentDir as getAgentDir3 } from "@earendil-works/pi-coding-agent";
 
 // src/resolve.ts
-import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
-import { join as join3, resolve } from "node:path";
+import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync3, statSync as statSync2 } from "node:fs";
+import { isAbsolute, join as join3, relative, resolve, sep } from "node:path";
 import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
+function isRecord2(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function safeIsDirectory(path) {
+  try {
+    return statSync2(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
 function npmPackageName(source) {
   if (source.startsWith("npm:")) {
     const rest = source.slice(4);
@@ -569,6 +753,13 @@ function npmPackageName(source) {
   }
   return null;
 }
+function npmPackageIdentity(source) {
+  const name = npmPackageName(source);
+  if (!name) return null;
+  const rest = source.startsWith("npm:") ? source.slice(4) : source;
+  const selector = rest.slice(name.length);
+  return { name, ...selector.startsWith("@") && selector.length > 1 ? { selector: selector.slice(1) } : {} };
+}
 function resolvePackageRoot(source, agentDir = getAgentDir2(), cwd = process.cwd()) {
   const npmName = npmPackageName(source);
   if (npmName) {
@@ -577,7 +768,7 @@ function resolvePackageRoot(source, agentDir = getAgentDir2(), cwd = process.cwd
       join3(cwd, ".pi", "npm", "node_modules", npmName)
     ];
     for (const c of candidates) {
-      if (existsSync3(c)) return c;
+      if (safeIsDirectory(c)) return c;
     }
     return null;
   }
@@ -588,9 +779,7 @@ function resolvePackageRoot(source, agentDir = getAgentDir2(), cwd = process.cwd
     return null;
   }
   const local = resolve(cwd, source);
-  if (existsSync3(local)) return local;
-  const abs = resolve(source);
-  if (existsSync3(abs)) return abs;
+  if (safeIsDirectory(local)) return local;
   return null;
 }
 function readPiManifest(packageRoot) {
@@ -598,7 +787,9 @@ function readPiManifest(packageRoot) {
   if (!existsSync3(pj)) return null;
   try {
     const pkg = JSON.parse(readFileSync3(pj, "utf-8"));
-    return pkg.pi && typeof pkg.pi === "object" ? pkg.pi : null;
+    if (!isRecord2(pkg) || !isRecord2(pkg.pi)) return null;
+    const extensions = Array.isArray(pkg.pi.extensions) ? pkg.pi.extensions.filter((entry) => typeof entry === "string" && entry.length > 0) : void 0;
+    return { extensions };
   } catch {
     return null;
   }
@@ -612,8 +803,15 @@ function resolveExtensionEntries(packageRoot) {
     const entries = [];
     for (const extPath of manifest.extensions) {
       const resolved = resolve(packageRoot, extPath);
+      const withinRoot = relative(packageRoot, resolved);
+      if (withinRoot === ".." || withinRoot.startsWith(`..${sep}`) || isAbsolute(withinRoot)) continue;
       if (!existsSync3(resolved)) continue;
-      const st = statSync(resolved);
+      let st;
+      try {
+        st = statSync2(resolved);
+      } catch {
+        continue;
+      }
       if (st.isFile() && isExtensionFile(resolved)) {
         entries.push(resolved);
         continue;
@@ -625,9 +823,9 @@ function resolveExtensionEntries(packageRoot) {
         else if (existsSync3(indexJs2)) entries.push(indexJs2);
         else {
           try {
-            for (const name of readdirSync(resolved)) {
-              if (isExtensionFile(name)) {
-                entries.push(join3(resolved, name));
+            for (const item of readdirSync(resolved, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+              if (item.isFile() && isExtensionFile(item.name)) {
+                entries.push(join3(resolved, item.name));
               }
             }
           } catch {
@@ -654,35 +852,52 @@ function resolveSpecPaths(spec, agentDir = getAgentDir2(), cwd = process.cwd()) 
   };
 }
 function isModuleLazyInSettings(source, settingsPackages) {
-  const target = normalizeSourceKey(source);
+  const matches = [];
   for (const entry of settingsPackages) {
     if (typeof entry === "string") {
-      if (normalizeSourceKey(entry) === target) return false;
+      if (sourcesMatch(entry, source)) matches.push(entry);
       continue;
     }
     if (entry && typeof entry === "object") {
       const obj = entry;
-      if (typeof obj.source === "string" && normalizeSourceKey(obj.source) === target) {
-        return Array.isArray(obj.extensions) && obj.extensions.length === 0;
-      }
+      if (typeof obj.source === "string" && sourcesMatch(obj.source, source)) matches.push(entry);
     }
   }
-  return false;
+  if (matches.length !== 1) return false;
+  const match = matches[0];
+  return !!match && typeof match === "object" && Array.isArray(match.extensions) && match.extensions.length === 0;
 }
 function normalizeSourceKey(source) {
-  const npm = npmPackageName(source);
-  if (npm) return `npm:${npm}`;
-  return source;
+  const trimmed = source.trim();
+  const npm = npmPackageName(trimmed);
+  if (npm) return `npm:${trimmed.startsWith("npm:") ? trimmed.slice(4) : trimmed}`;
+  return trimmed;
+}
+function sourcesMatch(left, right) {
+  const leftNpm = npmPackageIdentity(left);
+  const rightNpm = npmPackageIdentity(right);
+  if (leftNpm || rightNpm) {
+    if (!leftNpm || !rightNpm || leftNpm.name !== rightNpm.name) return false;
+    return !leftNpm.selector || !rightNpm.selector || leftNpm.selector === rightNpm.selector;
+  }
+  return normalizeSourceKey(left) === normalizeSourceKey(right);
 }
 function findSettingsPackageIndex(settingsPackages, source) {
-  const target = normalizeSourceKey(source);
-  return settingsPackages.findIndex((entry) => {
-    if (typeof entry === "string") return normalizeSourceKey(entry) === target;
-    if (entry && typeof entry === "object" && typeof entry.source === "string") {
-      return normalizeSourceKey(entry.source) === target;
+  return findSettingsPackageIndices(settingsPackages, source)[0] ?? -1;
+}
+function findSettingsPackageIndices(settingsPackages, source) {
+  const indices = [];
+  settingsPackages.forEach((entry, index) => {
+    if (typeof entry === "string") {
+      if (sourcesMatch(entry, source)) indices.push(index);
+      return;
     }
-    return false;
+    if (entry && typeof entry === "object" && typeof entry.source === "string") {
+      if (sourcesMatch(entry.source, source)) indices.push(index);
+      return;
+    }
   });
+  return indices;
 }
 
 // src/migrate.ts
@@ -701,7 +916,11 @@ function migrateSettings(agentDir = getAgentDir3()) {
   }
   let settings;
   try {
-    settings = JSON.parse(readFileSync4(settingsPath, "utf-8"));
+    const parsed = JSON.parse(readFileSync4(settingsPath, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("settings.json root must be an object");
+    }
+    settings = parsed;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, settingsPath, changed: [], skipped: [], added: [], error: message };
@@ -710,6 +929,19 @@ function migrateSettings(agentDir = getAgentDir3()) {
   const changed = [];
   const skipped = [];
   const added = [];
+  for (const spec of config.specs) {
+    const matches = findSettingsPackageIndices(packages, spec.source);
+    if (matches.length > 1) {
+      return {
+        ok: false,
+        settingsPath,
+        changed,
+        skipped,
+        added,
+        error: `duplicate settings.packages entries for ${spec.source} at indices ${matches.join(", ")}`
+      };
+    }
+  }
   for (const spec of managed) {
     const source = packageSource(spec);
     const idx = findSettingsPackageIndex(packages, spec.source);
@@ -748,12 +980,9 @@ function migrateSettings(agentDir = getAgentDir3()) {
     if (!(Array.isArray(obj.extensions) && obj.extensions.length === 0 && typeof obj.source === "string")) {
       continue;
     }
-    const otherFilters = Object.entries(obj).some(([k, v]) => {
-      if (k === "source" || k === "extensions") return false;
-      return Array.isArray(v) && v.length > 0;
-    });
-    if (otherFilters) continue;
-    packages[idx] = obj.source;
+    const restored = { ...obj };
+    delete restored.extensions;
+    packages[idx] = Object.keys(restored).length === 1 ? restored.source : restored;
     changed.push(`${spec.name} (restored eager)`);
   }
   if (changed.length === 0) {
@@ -761,16 +990,20 @@ function migrateSettings(agentDir = getAgentDir3()) {
   }
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
   const backupPath = `${settingsPath}.bak.lazy-${stamp}`;
-  copyFileSync(settingsPath, backupPath);
-  settings.packages = packages;
-  writeFileSync2(settingsPath, `${JSON.stringify(settings, null, 2)}
-`, "utf-8");
-  return { ok: true, backupPath, settingsPath, changed, skipped, added };
+  try {
+    copyFileSync(settingsPath, backupPath);
+    settings.packages = packages;
+    atomicWriteJson(settingsPath, settings);
+    return { ok: true, backupPath, settingsPath, changed, skipped, added };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, backupPath, settingsPath, changed, skipped, added, error: message };
+  }
 }
 
 // src/index.ts
 import { performance } from "node:perf_hooks";
-import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+import { copyFileSync as copyFileSync2, existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
 function readSettingsPackages(agentDir) {
   const path = getSettingsPath(agentDir);
   if (!existsSync5(path)) return [];
@@ -781,7 +1014,7 @@ function readSettingsPackages(agentDir) {
     return [];
   }
 }
-function buildCatalog(config, agentDir, cwd) {
+function buildCatalog(config, agentDir) {
   const packages = readSettingsPackages(agentDir);
   const map = /* @__PURE__ */ new Map();
   for (const spec of config.specs) {
@@ -801,7 +1034,8 @@ function buildCatalog(config, agentDir, cwd) {
       packageRoot: "",
       extensionPaths: [],
       moduleLazyReady,
-      state
+      state,
+      normalizedKeywords: (spec.keywords ?? []).map((keyword) => keyword.toLowerCase())
     });
   }
   return map;
@@ -811,9 +1045,10 @@ function formatStatus(rt) {
   const loaded = all.filter((e) => e.state === "loaded").length;
   const pending = all.filter((e) => e.state === "pending").length;
   const eager = all.filter((e) => e.state === "eager").length;
-  const errors = all.filter((e) => e.state === "error").length;
+  const errors = all.filter((e) => e.state === "error" || e.state === "poisoned").length;
   const parts = [`lazy ${loaded}\u2191`, `${pending}\xB7`, `${eager}\u26A1`];
   if (errors) parts.push(`${errors}\u2717`);
+  if (rt.restartRequired) parts.push("restart required");
   return parts.join(" ");
 }
 function refreshStatus(pi, rt, ctx) {
@@ -839,10 +1074,11 @@ function recordTiming(rt, label, started) {
   rt.profile.push({ label, ms: performance.now() - started });
   if (rt.profile.length > 100) rt.profile.shift();
 }
-async function loadByName(pi, rt, name, ctx) {
+async function loadByName(pi, rt, name, ctx, ancestry = []) {
   const key = name.trim();
+  if (!key) return { ok: false, name: key, error: "spec name must not be empty" };
   const entry = rt.entries.get(key) ?? [...rt.entries.values()].find(
-    (e) => e.spec.source === key || e.spec.source.endsWith(key) || e.spec.name.toLowerCase() === key.toLowerCase()
+    (e) => e.spec.source === key || e.spec.name.toLowerCase() === key.toLowerCase()
   );
   if (!entry) {
     return { ok: false, name: key, error: `unknown spec '${key}' \u2014 see /lazy list` };
@@ -857,15 +1093,23 @@ async function loadByName(pi, rt, name, ctx) {
   }
   if (!entry.packageRoot && entry.extensionPaths.length === 0) {
     const started2 = performance.now();
-    const resolved = resolveSpecPaths(entry.spec, getAgentDir4(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
-    entry.packageRoot = resolved.packageRoot ?? "";
-    entry.extensionPaths = resolved.extensionPaths;
-    entry.resolveMs = performance.now() - started2;
-    recordTiming(rt, `resolve:${entry.spec.name}`, started2);
+    try {
+      const resolved = resolveSpecPaths(entry.spec, getAgentDir4(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
+      entry.packageRoot = resolved.packageRoot ?? "";
+      entry.extensionPaths = resolved.extensionPaths;
+      entry.resolveMs = performance.now() - started2;
+      recordTiming(rt, `resolve:${entry.spec.name}`, started2);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      entry.state = "error";
+      entry.error = `failed to resolve ${entry.spec.source}: ${message}`;
+      return { ok: false, name: entry.spec.name, error: entry.error };
+    }
   }
   const started = performance.now();
   const result = await loadResolvedEntry(entry, pi, ctx ?? rt.sessionCtx, {
-    loadDependency: (dep) => loadByName(pi, rt, dep, ctx)
+    ancestry,
+    loadDependency: (dep, nextAncestry) => loadByName(pi, rt, dep, ctx, nextAncestry)
   });
   recordTiming(rt, `load:${entry.spec.name}`, started);
   refreshStatus(pi, rt, ctx ?? rt.sessionCtx);
@@ -878,11 +1122,17 @@ function registerStubs(pi, rt) {
     if (entry.state !== "pending") continue;
     const { spec } = entry;
     for (const cmd of spec.cmd ?? []) {
-      if (cmdOwners.has(cmd)) continue;
+      if (cmdOwners.has(cmd)) {
+        console.error(`[pi-lazy] command stub '${cmd}' is claimed by both '${cmdOwners.get(cmd)}' and '${spec.name}'`);
+        continue;
+      }
       cmdOwners.set(cmd, spec.name);
     }
     for (const tool of spec.tools ?? []) {
-      if (toolOwners.has(tool)) continue;
+      if (toolOwners.has(tool)) {
+        console.error(`[pi-lazy] tool stub '${tool}' is claimed by both '${toolOwners.get(tool)}' and '${spec.name}'`);
+        continue;
+      }
       toolOwners.set(tool, spec.name);
     }
     for (const key of spec.keys ?? []) {
@@ -918,8 +1168,10 @@ function registerStubs(pi, rt) {
           await real(args, ctx);
           return;
         }
-        const suffix = args?.trim() ? ` ${args.trim()}` : "";
-        pi.sendUserMessage(`/${cmd}${suffix}`, { deliverAs: "followUp" });
+        ctx.ui.notify(
+          `lazy: '${owner}' loaded but did not register /${cmd}; update lazy.json to the package's actual command name`,
+          "error"
+        );
       }
     });
   }
@@ -963,6 +1215,19 @@ function registerEventTriggers(pi, rt) {
       eventMap.set(ev, list);
     }
   }
+  const loadTriggered = async (names, ctx) => {
+    const limit = rt.config.autoLoadLimit ?? 1;
+    let loaded = 0;
+    for (const name of new Set(names)) {
+      if (loaded >= limit) break;
+      const current = rt.sessionCtx ?? ctx;
+      const res = await loadByName(pi, rt, name, current);
+      if (res.ok && !res.alreadyLoaded) {
+        loaded++;
+        notifySafe(rt.sessionCtx ?? current, `lazy: auto-loaded ${name}`, "info");
+      }
+    }
+  };
   pi.on("before_agent_start", async (event, ctx) => {
     if (!rt.auto) return;
     const prompt = (event.prompt ?? "").toLowerCase();
@@ -972,36 +1237,41 @@ function registerEventTriggers(pi, rt) {
     }
     for (const entry of rt.entries.values()) {
       if (entry.state !== "pending") continue;
-      for (const kw of entry.spec.keywords ?? []) {
-        if (kw && prompt.includes(kw.toLowerCase())) {
+      for (const keyword of entry.normalizedKeywords ?? []) {
+        if (prompt.includes(keyword)) {
           toLoad.add(entry.spec.name);
           break;
         }
       }
     }
-    const limit = rt.config.autoLoadLimit ?? 1;
-    for (const name of [...toLoad].slice(0, limit)) {
-      const current = rt.sessionCtx ?? ctx;
-      const res = await loadByName(pi, rt, name, current);
-      if (res.ok && !res.alreadyLoaded) {
-        notifySafe(rt.sessionCtx ?? current, `lazy: auto-loaded ${name}`, "info");
-      }
-    }
+    await loadTriggered(toLoad, ctx);
   });
+  for (const [eventName, owners] of eventMap) {
+    if (eventName === "before_agent_start") continue;
+    try {
+      pi.on(eventName, async (_event, ctx) => {
+        if (rt.auto) await loadTriggered(owners, ctx);
+      });
+    } catch (err) {
+      console.error(`[pi-lazy] unsupported event trigger '${eventName}': ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
-async function runAfterStart(pi, rt, ctx) {
+async function runAfterStart(pi, rt, ctx, generation) {
   const queue = [...rt.entries.values()].filter((e) => e.state === "pending" && e.spec.lazy === "after-start").sort((a, b) => (a.spec.priority ?? 100) - (b.spec.priority ?? 100));
   const batchSize = rt.config.afterStartBatchSize ?? 1;
   const delayMs = rt.config.afterStartDelayMs ?? 0;
-  for (let i = 0; i < queue.length && !rt.queueCancelled; i += batchSize) {
+  for (let i = 0; i < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration; i += batchSize) {
     for (const entry of queue.slice(i, i + batchSize)) {
+      if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
       const current = rt.sessionCtx ?? ctx;
       const res = await loadByName(pi, rt, entry.spec.name, current);
+      if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
       if (!res.ok) {
         notifySafe(rt.sessionCtx ?? current, `lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
       }
     }
-    if (i + batchSize < queue.length && !rt.queueCancelled) {
+    if (i + batchSize < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration) {
       await new Promise((resolve2) => setTimeout(resolve2, delayMs));
     }
   }
@@ -1009,7 +1279,7 @@ async function runAfterStart(pi, rt, ctx) {
 }
 function listLines(rt) {
   const lines = [];
-  const order = ["pending", "loading", "loaded", "error", "eager"];
+  const order = ["pending", "loading", "loaded", "error", "poisoned", "eager"];
   const sorted = [...rt.entries.values()].sort((a, b) => {
     const ai = order.indexOf(a.state);
     const bi = order.indexOf(b.state);
@@ -1025,33 +1295,28 @@ function listLines(rt) {
   }
   return lines;
 }
-function piLazy(pi) {
-  const agentDir = getAgentDir4();
+function createPiLazy(pi, agentDir = getAgentDir4()) {
   const config = loadConfig(agentDir);
+  const catalogStarted = performance.now();
   const rt = {
     config,
-    entries: /* @__PURE__ */ new Map(),
+    entries: buildCatalog(config, agentDir),
     auto: config.auto !== false,
     afterStartQueued: false,
     status: "lazy \u2026",
     profile: [],
-    queueCancelled: false
+    queueCancelled: false,
+    sessionGeneration: 0,
+    restartRequired: false
   };
-  const rebuild = (cwd) => {
-    const started = performance.now();
-    rt.config = loadConfig(agentDir);
-    rt.auto = rt.config.auto !== false;
-    rt.entries = buildCatalog(rt.config, agentDir, cwd);
-    rt.status = formatStatus(rt);
-    recordTiming(rt, "catalog", started);
-  };
-  rebuild(process.cwd());
+  recordTiming(rt, "catalog", catalogStarted);
   registerStubs(pi, rt);
   registerEventTriggers(pi, rt);
   pi.on("session_start", async (event, ctx) => {
+    rt.sessionGeneration++;
+    const generation = rt.sessionGeneration;
     rt.sessionCtx = ctx;
     rt.queueCancelled = false;
-    rebuild(ctx.cwd);
     refreshStatus(pi, rt, ctx);
     const needsMigrate = [...rt.entries.values()].some(
       (e) => isManagedLazy(e.spec) && !e.moduleLazyReady
@@ -1059,14 +1324,19 @@ function piLazy(pi) {
     if (needsMigrate && event.reason === "startup") {
       ctx.ui.notify("pi-lazy: run /lazy migrate then restart for true module-lazy", "info");
     }
-    if (!rt.afterStartQueued) {
-      rt.afterStartQueued = true;
-      setTimeout(() => {
-        void runAfterStart(pi, rt, ctx);
-      }, 0);
-    }
+    rt.afterStartQueued = true;
+    setTimeout(() => {
+      void runAfterStart(pi, rt, ctx, generation).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[pi-lazy] after-start queue failed: ${message}`);
+        notifySafe(rt.sessionCtx, `lazy: after-start queue failed: ${message}`, "warning");
+      }).finally(() => {
+        if (generation === rt.sessionGeneration) rt.afterStartQueued = false;
+      });
+    }, 0);
   });
   pi.on("session_shutdown", () => {
+    rt.sessionGeneration++;
     rt.sessionCtx = void 0;
     rt.afterStartQueued = false;
     rt.queueCancelled = true;
@@ -1109,18 +1379,39 @@ function piLazy(pi) {
         return;
       }
       if (sub === "init") {
-        const path = saveConfig(defaultConfig(), agentDir);
-        rebuild(ctx.cwd);
-        ctx.ui.notify(`wrote default config \u2192 ${path}`, "info");
+        try {
+          const currentPath = getLazyConfigPath(agentDir);
+          let backup = "";
+          if (existsSync5(currentPath)) {
+            const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+            backup = `${currentPath}.bak.init-${stamp}`;
+            copyFileSync2(currentPath, backup);
+          }
+          const path = saveConfig(defaultConfig(), agentDir);
+          rt.restartRequired = true;
+          refreshStatus(pi, rt, ctx);
+          ctx.ui.notify(`wrote default config \u2192 ${path}${backup ? `
+backup: ${backup}` : ""}
+Reload or restart Pi to apply it.`, "info");
+        } catch (err) {
+          ctx.ui.notify(`failed to initialize config: ${err instanceof Error ? err.message : String(err)}`, "error");
+        }
         return;
       }
       if (sub === "auto") {
         const mode = (rest[0] ?? "").toLowerCase();
         if (mode === "on" || mode === "off") {
-          rt.auto = mode === "on";
-          rt.config.auto = rt.auto;
-          saveConfig(rt.config, agentDir);
-          ctx.ui.notify(`lazy auto ${mode}`, "info");
+          const previous = rt.auto;
+          try {
+            rt.auto = mode === "on";
+            rt.config.auto = rt.auto;
+            saveConfig(rt.config, agentDir);
+            ctx.ui.notify(`lazy auto ${mode}`, "info");
+          } catch (err) {
+            rt.auto = previous;
+            rt.config.auto = previous;
+            ctx.ui.notify(`failed to save config: ${err instanceof Error ? err.message : String(err)}`, "error");
+          }
           return;
         }
         ctx.ui.notify(`lazy auto is ${rt.auto ? "on" : "off"} (usage: /lazy auto on|off)`, "info");
@@ -1140,7 +1431,7 @@ function piLazy(pi) {
           "Restart pi to apply module-lazy (extensions filtered to [])."
         ].filter(Boolean);
         ctx.ui.notify(lines.join("\n"), "info");
-        rebuild(ctx.cwd);
+        if (result.changed.length > 0) rt.restartRequired = true;
         refreshStatus(pi, rt, ctx);
         return;
       }
@@ -1205,6 +1496,10 @@ function piLazy(pi) {
     }
   });
 }
+function piLazy(pi) {
+  return createPiLazy(pi, getAgentDir4());
+}
 export {
+  createPiLazy,
   piLazy as default
 };

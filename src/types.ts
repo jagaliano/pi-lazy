@@ -4,7 +4,7 @@
 
 export type LazyMode = false | true | "after-start";
 
-export type SpecState = "eager" | "pending" | "loading" | "loaded" | "error";
+export type SpecState = "eager" | "pending" | "loading" | "loaded" | "error" | "poisoned";
 
 export interface LazySpec {
 	/** Stable id used by /lazy load <name> */
@@ -67,6 +67,10 @@ export interface ResolvedEntry {
 	loadedCommands?: string[];
 	/** Real command handlers captured while loading, keyed by command name. */
 	loadedCommandHandlers?: Map<string, (args: string, ctx: any) => Promise<void>>;
+	/** Shared by every caller while this entry is being loaded. */
+	loadPromise?: Promise<LoadResult>;
+	/** Normalized once during catalog construction for prompt matching. */
+	normalizedKeywords?: string[];
 }
 
 export interface LoadResult {

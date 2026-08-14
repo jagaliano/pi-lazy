@@ -1,6 +1,6 @@
 {
   "name": "@rahularya01/pi-lazy",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "LazyVim-style extension manager for Pi Coding Agent \u2014 load packages after start or on demand (cmd/tools/keywords).",
   "author": "Rahul Arya",
   "license": "MIT",
@@ -40,7 +40,7 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --external:@earendil-works/pi-coding-agent --external:typebox",
     "check": "npm run typecheck && npm run build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test:integration": "node scripts/integration-load.mjs",
     "test:smoke": "node scripts/smoke-pi.mjs",
     "test": "npm run check && npm run test:integration",
@@ -52,13 +52,13 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1",
     "typebox": "^1.0.17"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+	"@earendil-works/pi-coding-agent": ">=0.81.1"
   },
   "devDependencies": {
+	"@earendil-works/pi-coding-agent": "^0.84.2",
     "@types/node": "^24.0.0",
     "esbuild": "^0.25.12",
     "typescript": "^5.9.0"

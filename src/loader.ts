@@ -156,8 +156,20 @@ async function importFactory(extensionPath: string): Promise<((api: ExtensionAPI
 			const mod = await import(fileUrl(extensionPath));
 			const factory = asFactory(mod);
 			if (factory) return factory;
-		} catch {
-			/* try jiti */
+		} catch (err) {
+			// Loader/linker failures occur before evaluation and are safe to retry with
+			// jiti's host aliases. Runtime exceptions may already have performed side
+			// effects, so preserve them instead of evaluating the module a second time.
+			const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
+			if (!(err instanceof SyntaxError) && ![
+				"ERR_MODULE_NOT_FOUND",
+				"ERR_PACKAGE_PATH_NOT_EXPORTED",
+				"ERR_UNKNOWN_FILE_EXTENSION",
+			].includes(code)) {
+				throw new Error(`Failed to import extension module ${extensionPath}: ${err instanceof Error ? err.message : String(err)}`, {
+					cause: err,
+				});
+			}
 		}
 	}
 
@@ -196,7 +208,7 @@ async function importFactory(extensionPath: string): Promise<((api: ExtensionAPI
 		throw new Error("jiti instance missing async import()");
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to import extension module ${extensionPath}: ${message}`);
+		throw new Error(`Failed to import extension module ${extensionPath}: ${message}`, { cause: err });
 	}
 }
 
@@ -352,10 +364,19 @@ export async function loadResolvedEntry(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext | undefined,
 	deps: {
-		loadDependency: (name: string) => Promise<LoadResult>;
+		loadDependency: (name: string, ancestry: string[]) => Promise<LoadResult>;
+		ancestry?: string[];
 	},
 ): Promise<LoadResult> {
 	const { spec } = entry;
+	const ancestry = deps.ancestry ?? [];
+	if (ancestry.includes(spec.name)) {
+		return {
+			ok: false,
+			name: spec.name,
+			error: `dependency cycle: ${[...ancestry, spec.name].join(" -> ")}`,
+		};
+	}
 	if (entry.state === "loaded") {
 		return {
 			ok: true,
@@ -370,6 +391,10 @@ export async function loadResolvedEntry(
 			loadMs: entry.loadMs,
 		};
 	}
+	if (entry.state === "poisoned") {
+		return { ok: false, name: spec.name, error: entry.error ?? "partial activation failed — restart required" };
+	}
+	if (entry.loadPromise) return entry.loadPromise;
 	if (entry.state === "loading") {
 		return { ok: false, name: spec.name, error: "already loading" };
 	}
@@ -390,94 +415,106 @@ export async function loadResolvedEntry(
 		};
 	}
 
-	// Dependencies first
-	for (const dep of spec.dependencies ?? []) {
-		const depResult = await deps.loadDependency(dep);
-		if (!depResult.ok && !depResult.alreadyLoaded) {
-			return { ok: false, name: spec.name, error: `dependency ${dep} failed: ${depResult.error}` };
-		}
-	}
-
 	entry.state = "loading";
-	const started = Date.now();
-	const track: LoadTrack = {
-		tools: [],
-		commands: [],
-		commandHandlers: new Map(),
-		sessionStartHandlers: [],
-		resourcesDiscoverHandlers: [],
-	};
-	const api = createTrackingApi(pi, track);
-
-	try {
-		for (const extPath of entry.extensionPaths) {
-			const factory = await importFactory(extPath);
-			if (!factory) {
-				throw new Error(`Extension does not export a default factory: ${extPath}`);
-			}
-			await factory(api);
-		}
-
-		// Replay session_start for factories that registered too late for the real event.
-		if (ctx && track.sessionStartHandlers.length > 0) {
-			const event = { type: "session_start" as const, reason: "startup" as const };
-			for (const handler of track.sessionStartHandlers) {
-				try {
-					await handler(event, ctx);
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					console.error(`[pi-lazy] session_start handler error in ${spec.name}: ${message}`);
-				}
-			}
-		}
-
-		// Best-effort resources_discover (skills/prompts already eager if not filtered)
-		if (ctx && track.resourcesDiscoverHandlers.length > 0) {
-			const event = { type: "resources_discover" as const, cwd: ctx.cwd, reason: "startup" as const };
-			for (const handler of track.resourcesDiscoverHandlers) {
-				try {
-					await handler(event, ctx);
-				} catch {
-					/* ignore */
-				}
-			}
-		}
-
-		// Activate newly registered tools additively when possible
-		if (track.tools.length > 0 && typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
-			try {
-				const active = pi.getActiveTools();
-				const merged = [...new Set([...active, ...track.tools])];
-				pi.setActiveTools(merged);
-			} catch {
-				/* runtime may not be bound yet */
-			}
-		}
-
-		const loadMs = Date.now() - started;
-		entry.state = "loaded";
-		entry.loadedAt = Date.now();
-		entry.loadMs = loadMs;
-		entry.loadedTools = track.tools;
-		entry.loadedCommands = track.commands;
-		entry.loadedCommandHandlers = track.commandHandlers;
-		entry.error = undefined;
-
-		return {
-			ok: true,
-			name: spec.name,
-			loadMs,
-			tools: track.tools,
-			commands: track.commands,
-			// IMPORTANT: LoadResult must stay structuredClone-safe. Never include
-			// commandHandlers (Map<string, Function>) here — pi structuredClones
-			// tool-result `details` for the transcript and functions throw
-			// DataCloneError: "... could not be cloned."
+	const loadPromise = (async (): Promise<LoadResult> => {
+		const started = Date.now();
+		const track: LoadTrack = {
+			tools: [],
+			commands: [],
+			commandHandlers: new Map(),
+			sessionStartHandlers: [],
+			resourcesDiscoverHandlers: [],
 		};
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		entry.state = "error";
-		entry.error = message;
-		return { ok: false, name: spec.name, error: message };
+		const api = createTrackingApi(pi, track);
+		let activationStarted = false;
+
+		try {
+			for (const dep of spec.dependencies ?? []) {
+				const depResult = await deps.loadDependency(dep, [...ancestry, spec.name]);
+				if (!depResult.ok && !depResult.alreadyLoaded) {
+					throw new Error(`dependency ${dep} failed: ${depResult.error}`);
+				}
+			}
+
+			// Import every entrypoint before allowing any factory to mutate the live API.
+			const factories: Array<(api: ExtensionAPI) => unknown> = [];
+			for (const extPath of entry.extensionPaths) {
+				const factory = await importFactory(extPath);
+				if (!factory) throw new Error(`Extension does not export a default factory: ${extPath}`);
+				factories.push(factory);
+			}
+			for (const factory of factories) {
+				activationStarted = true;
+				await factory(api);
+			}
+
+			// Replay session_start for factories that registered too late for the real event.
+			if (ctx && track.sessionStartHandlers.length > 0) {
+				const event = { type: "session_start" as const, reason: "startup" as const };
+				for (const handler of track.sessionStartHandlers) {
+					try {
+						await handler(event, ctx);
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						console.error(`[pi-lazy] session_start handler error in ${spec.name}: ${message}`);
+					}
+				}
+			}
+
+			// Best-effort resources_discover (skills/prompts already eager if not filtered)
+			if (ctx && track.resourcesDiscoverHandlers.length > 0) {
+				const event = { type: "resources_discover" as const, cwd: ctx.cwd, reason: "startup" as const };
+				for (const handler of track.resourcesDiscoverHandlers) {
+					try {
+						await handler(event, ctx);
+					} catch {
+						/* ignore */
+					}
+				}
+			}
+
+			// Activate newly registered tools additively when possible
+			if (track.tools.length > 0 && typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
+				try {
+					const active = pi.getActiveTools();
+					const merged = [...new Set([...active, ...track.tools])];
+					pi.setActiveTools(merged);
+				} catch {
+					/* runtime may not be bound yet */
+				}
+			}
+
+			const loadMs = Date.now() - started;
+			entry.state = "loaded";
+			entry.loadedAt = Date.now();
+			entry.loadMs = loadMs;
+			entry.loadedTools = [...new Set(track.tools)];
+			entry.loadedCommands = [...new Set(track.commands)];
+			entry.loadedCommandHandlers = track.commandHandlers;
+			entry.error = undefined;
+
+			return {
+				ok: true,
+				name: spec.name,
+				loadMs,
+				tools: entry.loadedTools,
+				commands: entry.loadedCommands,
+				// IMPORTANT: LoadResult must stay structuredClone-safe. Never include
+				// commandHandlers (Map<string, Function>) here — pi structuredClones
+				// tool-result `details` for the transcript and functions throw
+				// DataCloneError: "... could not be cloned."
+			};
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			entry.state = activationStarted ? "poisoned" : "error";
+			entry.error = activationStarted ? `${message} (partial activation may have occurred — restart required)` : message;
+			return { ok: false, name: spec.name, error: entry.error };
+		}
+	})();
+	entry.loadPromise = loadPromise;
+	try {
+		return await loadPromise;
+	} finally {
+		entry.loadPromise = undefined;
 	}
 }

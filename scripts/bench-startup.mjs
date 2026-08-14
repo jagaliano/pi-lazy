@@ -12,7 +12,11 @@ import { performance } from "node:perf_hooks";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const REAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
-const RUNS = Math.max(1, Number(process.env.BENCH_RUNS ?? 3));
+const parsedRuns = Number(process.env.BENCH_RUNS ?? 3);
+const RUNS = Number.isInteger(parsedRuns) && parsedRuns > 0 ? parsedRuns : 3;
+const parsedTimeout = Number(process.env.BENCH_TIMEOUT_MS ?? 180_000);
+const TIMEOUT_MS = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 180_000;
+const OUTPUT_LIMIT = 1_000_000;
 const REPORT = resolve(process.env.BENCH_REPORT ?? join(ROOT, ".benchmark-report.json"));
 const tempAgent = mkdtempSync(join(tmpdir(), "pi-lazy-bench-"));
 
@@ -33,10 +37,31 @@ function runPi(args, env) {
 		const child = spawn("pi", args, { env, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
-		child.stdout.on("data", (chunk) => (stdout += chunk));
-		child.stderr.on("data", (chunk) => (stderr += chunk));
-		child.once("error", reject);
-		child.once("close", (code) => resolveRun({ ms: performance.now() - started, code, stdout, stderr }));
+		let settled = false;
+		let timedOut = false;
+		let killTimer;
+		const append = (current, chunk) => (current + chunk).slice(-OUTPUT_LIMIT);
+		child.stdout.on("data", (chunk) => (stdout = append(stdout, chunk)));
+		child.stderr.on("data", (chunk) => (stderr = append(stderr, chunk)));
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+			killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+		}, TIMEOUT_MS);
+		child.once("error", (err) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			clearTimeout(killTimer);
+			reject(err);
+		});
+		child.once("close", (code, signal) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			clearTimeout(killTimer);
+			resolveRun({ ms: performance.now() - started, code, signal, timedOut, stdout, stderr });
+		});
 	});
 }
 

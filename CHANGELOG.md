@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.7
+
+- Coalesce concurrent loads, reject dependency cycles, and prevent retries after partial factory activation.
+- Preserve loaded extensions across session changes and cancel stale after-start queues with generation tokens.
+- Make configuration/settings writes atomic; validate config fields and preserve package metadata during migration.
+- Keep migrated packages eager until restart, support configured event names, and remove recursive command redispatch.
+- Replace machine-specific integration/smoke scripts with hermetic tests and portable artifact verification.
+- Move the Pi host to peer/dev dependencies and update the lockfile to clear dependency audit findings.
+
 ## 0.2.6
 
 - **Fix DataCloneError on every lazy load** ("`... could not be cloned`"):

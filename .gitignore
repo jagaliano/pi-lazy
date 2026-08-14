@@ -7,4 +7,5 @@ node_modules/
 .probe-*
 .todo-*
 .integration-report.json
+.test-build-*
 *.tgz
