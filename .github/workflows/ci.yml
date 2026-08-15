@@ -16,7 +16,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        # Node 20 is excluded: undici bundled by the @earendil-works/pi-coding-agent
+        # devDependency requires Node >=22.19 and crashes the test suite on Node 20.
+        # This only affects dev tooling — the published dist/index.js has no such
+        # requirement, so the package's own "engines": ">=20" is still accurate.
+        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
         with:

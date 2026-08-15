@@ -506,6 +506,10 @@ pi-lazy: run /lazy migrate then restart for true module-lazy
 
 ## Development
 
+> **Node 22+ required for the test suite** — the `@earendil-works/pi-coding-agent` dev dependency
+> bundles an `undici` version that needs Node ≥22.19. The published package itself still supports
+> Node 20+ at runtime; only running `npm test` locally needs the newer Node.
+
 ```bash
 git clone https://github.com/Rahularya01/pi-lazy
 cd pi-lazy
