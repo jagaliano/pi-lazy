@@ -3,11 +3,33 @@
 [![npm version](https://img.shields.io/npm/v/@rahularya01/pi-lazy?logo=npm)](https://www.npmjs.com/package/@rahularya01/pi-lazy)
 [![license](https://img.shields.io/npm/l/@rahularya01/pi-lazy)](LICENSE)
 
-**LazyVim-style extension manager** for [Pi Coding Agent](https://github.com/badlogic/pi-mono).
+**A LazyVim-style extension manager for [Pi Coding Agent](https://github.com/badlogic/pi-mono).**
 
-Keep packages installed under `~/.pi/agent/npm/`, but **don’t run their extension factories** until after start — or until you actually need them (slash command, tool stub, keyword, shortcut, event, or `/lazy load`).
+If you've used [LazyVim](https://www.lazyvim.org/), the idea will feel familiar: keep every
+package installed, but only pay the startup cost for the ones you actually use right away.
+Everything else loads the moment you reach for it — a slash command, a tool call, a keyword in
+your prompt, a shortcut, or a manual `/lazy load`.
 
-Faster Pi startup, less noise in the tool list, and the same packages available the moment you need them.
+**The result:** a faster Pi startup, a shorter tool list for the model to reason about, and every
+package still just one command or keyword away.
+
+## Table of contents
+
+- [Requirements](#requirements)
+- [Install](#install)
+- [First-time setup](#first-time-setup-required-for-true-lazy-loading)
+- [Quick start](#quick-start)
+- [Mental model (LazyVim → Pi)](#mental-model-lazyvim--pi)
+- [Load strategies](#load-strategies)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [LLM tool: `lazy_load`](#llm-tool-lazy_load)
+- [How load works](#how-load-works)
+- [Recipes](#recipes)
+- [Troubleshooting](#troubleshooting)
+- [Limits (v1)](#limits-v1)
+- [Development](#development)
+- [Publish](#publish)
 
 ## Requirements
 
@@ -28,7 +50,7 @@ pi install /absolute/path/to/pi-lazy
 pi install git:github.com/Rahularya01/pi-lazy
 ```
 
-Or add to `~/.pi/agent/settings.json`:
+Or add it directly to `~/.pi/agent/settings.json`:
 
 ```json
 {
@@ -36,9 +58,12 @@ Or add to `~/.pi/agent/settings.json`:
 }
 ```
 
-Restart Pi (or `/reload`) after install. **pi-lazy itself is always-on** — it must load at startup so it can manage everything else.
+Then restart Pi (or run `/reload`).
 
-Update later with:
+> **Note:** pi-lazy itself is always-on — it has to load at startup so it can manage everything
+> else.
+
+Update it later with:
 
 ```bash
 pi update npm:@rahularya01/pi-lazy
@@ -46,7 +71,9 @@ pi update npm:@rahularya01/pi-lazy
 
 ## First-time setup (required for true lazy loading)
 
-Installing pi-lazy alone is not enough. Pi still eager-loads every package listed as a plain string in `settings.packages`. You need **migrate once**, then restart.
+Installing pi-lazy alone isn't enough — Pi still eager-loads every package listed as a plain
+string in `settings.packages`. You need to **migrate once, then restart**. It's a three-step
+process:
 
 ### 1. Install pi-lazy and restart
 
@@ -56,58 +83,61 @@ pi install npm:@rahularya01/pi-lazy
 
 Restart Pi or run `/reload`.
 
-### 2. Seed / review config
+### 2. Seed and review your config
 
-On first run, pi-lazy writes a default catalog to:
+On first run, pi-lazy writes a default catalog to `~/.pi/agent/lazy.json`.
 
-```text
-~/.pi/agent/lazy.json
-```
-
-Edit that file to match **your** installed packages (see [Configuration](#configuration)). Or rewrite the defaults anytime:
+Edit that file to match **your** installed packages — see [Configuration](#configuration) below.
+You can also rewrite it back to the defaults anytime with:
 
 ```text
 /lazy init
 ```
 
-Only list packages you actually have installed. Specs for missing packages show up as errors when you try to load them.
+Only list packages you actually have installed — specs for missing packages will show up as
+errors when you try to load them.
 
-### 3. Migrate settings
+### 3. Migrate your settings
 
 ```text
 /lazy migrate
 ```
 
-This:
+This command:
 
 1. Backs up `~/.pi/agent/settings.json` to `settings.json.bak.lazy-<timestamp>`
-2. Rewrites managed (`lazy !== false`) packages from:
+2. Rewrites managed (`lazy !== false`) packages from a plain string:
 
    ```json
    "npm:pi-web-access"
    ```
 
-   to:
+   into an object with an empty extension filter:
 
    ```json
    { "source": "npm:pi-web-access", "extensions": [] }
    ```
 
-The package stays installed (skills/prompts can still load). Pi will **not** execute the extension factory at startup. pi-lazy loads those factories later.
+The package stays installed — its skills and prompts can still load — but Pi will **not** execute
+its extension factory at startup. pi-lazy takes over and loads that factory later, on your terms.
 
-Eager specs (`"lazy": false`) that were previously filtered empty are restored to plain string form when safe.
+Eager specs (`"lazy": false`) that were previously filtered empty are restored to plain string
+form automatically when it's safe to do so.
 
 ### 4. Restart Pi again
 
-Module-lazy filters apply on the next process start. After restart:
+Module-lazy filters only apply on the *next* process start, so restart one more time. After that,
+running:
 
 ```text
 /lazy
 ```
 
-You should see managed on-demand packages as `pending`, not `eager`. Statusline shows something like `lazy 0↑ 4· 3⚡`.
+should show your managed on-demand packages as `pending`, not `eager`. The statusline will show
+something like `lazy 0↑ 4· 3⚡`.
 
-If you skip migrate, packages stay eager: Pi loads them normally and `/lazy load` will tell you to migrate + restart.
+> If you skip the migrate step, packages stay eager — Pi loads them normally, and `/lazy load`
+> will just tell you to migrate and restart.
 
 ## Quick start
 
@@ -118,13 +148,17 @@ If you skip migrate, packages stay eager: Pi loads them normally and `/lazy load
 /web                   # stub command: loads "web", then re-runs /web
 ```
 
-Typical flow after migrate:
+A typical setup after migrating looks like this:
 
-1. Providers (`cursor`, `antigravity`, …) stay `"lazy": false` → available immediately.
-2. Common helpers (`subagents`, `todo`, …) use `"lazy": "after-start"` → load right after the UI is up (VeryLazy).
-3. Heavy packs (`web`, `mcp`, `lens`, …) use `"lazy": true` → load on first `/cmd`, tool stub, keyword match, or `/lazy load`.
+1. **Providers** (`cursor`, `antigravity`, …) stay `"lazy": false` → available immediately.
+2. **Common helpers** (`subagents`, `todo`, …) use `"lazy": "after-start"` → load right after the
+   UI is up.
+3. **Heavy packs** (`web`, `mcp`, `lens`, …) use `"lazy": true` → load on first `/cmd`, tool stub,
+   keyword match, or `/lazy load`.
 
 ## Mental model (LazyVim → Pi)
+
+Already know LazyVim? Here's the direct translation:
 
 | LazyVim | pi-lazy |
 | -------- | --------- |
@@ -139,6 +173,8 @@ Typical flow after migrate:
 
 ## Load strategies
 
+Every package spec picks one of three strategies via its `lazy` field:
+
 | `lazy` value | When it loads | Good for |
 | ------------ | ------------- | -------- |
 | `false` | With Pi at startup (not managed by pi-lazy) | Providers, auth, anything you need before the first prompt |
@@ -147,7 +183,7 @@ Typical flow after migrate:
 
 ### On-demand triggers (`lazy: true`)
 
-Any of these can load a pending package:
+Any of the following can wake up a pending package:
 
 | Trigger | How |
 | ------- | --- |
@@ -158,16 +194,18 @@ Any of these can load a pending package:
 | Events | Spec `"event": ["before_agent_start"]` → load whenever that Pi event fires (when auto is on) |
 | Shortcuts | Spec `"keys": ["…"]` → registered shortcut loads the package |
 
-Keyword and event auto-load can be toggled:
+Keyword and event auto-load can be toggled on or off:
 
 ```text
 /lazy auto off
 /lazy auto on
 ```
 
-Default is **on** (`"auto": true` in `lazy.json`).
+It's **on** by default (`"auto": true` in `lazy.json`).
 
 ### Dependencies
+
+Packages can depend on each other:
 
 ```json
 {
@@ -178,17 +216,19 @@ Default is **on** (`"auto": true` in `lazy.json`).
 }
 ```
 
-`/lazy load my-pack` loads `context-mode` first. If a dependency fails, the parent load fails with a clear error. Dependency cycles are rejected with the complete cycle path, and concurrent requests for the same package share one load.
+`/lazy load my-pack` loads `context-mode` first. If a dependency fails, the parent load fails with
+a clear error. Dependency cycles are rejected with the complete cycle path, and concurrent
+requests for the same package share a single load.
 
 ## Configuration
 
-Path: **`~/.pi/agent/lazy.json`**
+Everything lives in one file: **`~/.pi/agent/lazy.json`**
 
 - Auto-created on first run from built-in defaults
 - Reset with `/lazy init` (backs up the old file, then requires a reload/restart)
-- Show path with `/lazy config`
+- Show its path anytime with `/lazy config`
 
-Full example (also in [`examples/lazy.json`](./examples/lazy.json)):
+Here's a full example (also in [`examples/lazy.json`](./examples/lazy.json)):
 
 ```json
 {
@@ -269,9 +309,10 @@ Keep **`lazy: false`** for:
 - Anything you need before the first agent turn
 - Packages whose absence would break your default workflow
 
-Prefer **`after-start`** for packs you use most sessions but that are not boot-critical.
+Prefer **`after-start`** for packs you use most sessions but that aren't boot-critical.
 
-Prefer **`true` (on-demand)** for large MCP bridges, web fetch, lens/LSP, plan mode, and other situational tools.
+Prefer **`true` (on-demand)** for large MCP bridges, web fetch, lens/LSP, plan mode, and other
+situational tools.
 
 ### Matching `source` to installed packages
 
@@ -283,18 +324,20 @@ Prefer **`true` (on-demand)** for large MCP bridges, web fetch, lens/LSP, plan m
 | `pi install npm:@rahularya01/pi-cursor` | `"npm:@rahularya01/pi-cursor"` |
 | Local path | Absolute or cwd-relative path to the package root |
 
-pi-lazy resolves npm packages from:
+pi-lazy resolves npm packages from, in order:
 
 1. `~/.pi/agent/npm/node_modules/<name>`
 2. `<cwd>/.pi/npm/node_modules/<name>`
 
-If the package isn’t installed there, load fails with “package not installed”.
+If the package isn't installed in either location, the load fails with "package not installed".
 
 ### Stub names must be declared
 
-Command and tool stubs **only** exist for names listed in the spec. If `pi-web-access` registers `web_search` but your spec omits it from `"tools"`, the model won’t see a lazy stub for that tool until the package is loaded another way (keyword, `/lazy load`, etc.).
+Command and tool stubs **only** exist for names listed in the spec. If `pi-web-access` registers
+`web_search` but your spec omits it from `"tools"`, the model won't see a lazy stub for that tool
+until the package is loaded some other way (keyword, `/lazy load`, etc.).
 
-Declare the commands and tools you care about triggering:
+So declare the commands and tools you actually want to trigger a load:
 
 ```json
 {
@@ -358,23 +401,29 @@ error    mcp              on-demand    npm:pi-mcp-adapter — package not instal
 
 ## LLM tool: `lazy_load`
 
-The model can load a deferred package by spec name:
+The model itself can load a deferred package by spec name:
 
 ```text
 lazy_load({ name: "web" })
 ```
 
-Use when a capability is still pending (`web`, `mcp`, `lens`, `plannotator`, `context-mode`, …). Prefer names from `/lazy list`.
+Use it when a capability is still pending (`web`, `mcp`, `lens`, `plannotator`, `context-mode`,
+…). Prefer names from `/lazy list`.
 
-After a successful load, newly registered tools are merged into the active tool set when the runtime supports `getActiveTools` / `setActiveTools`. Stub tools still tell the model to **call the real tool again on the next turn** after the first activation.
+After a successful load, newly registered tools are merged into the active tool set when the
+runtime supports `getActiveTools` / `setActiveTools`. Stub tools still tell the model to **call
+the real tool again on the next turn** after the first activation.
 
 ## How load works
 
-1. Resolve the package under Pi’s npm (or local) install tree
-2. Read `package.json` → `pi.extensions` (same rules as Pi’s own loader)
+When a trigger fires, pi-lazy runs through these steps:
+
+1. Resolve the package under Pi's npm (or local) install tree
+2. Read `package.json` → `pi.extensions` (same rules as Pi's own loader)
 3. Import the factory (`import()` for JS; **jiti** for TypeScript — from the Pi install)
 4. Call `factory(hostPi)` so tools, commands, and handlers attach to the **live** runtime
-5. Replay `session_start` (and best-effort `resources_discover`) handlers registered during that late load
+5. Replay `session_start` (and best-effort `resources_discover`) handlers registered during that
+   late load
 6. Additively `setActiveTools` for any tools registered during the load
 
 Dependencies are loaded depth-first before the requested package.
@@ -403,7 +452,7 @@ Or ask the agent to call `lazy_load` for those names.
 /lazy auto off
 ```
 
-Manual `/lazy load` and stub `/cmd` / tools still work. Turn back on with `/lazy auto on`.
+Manual `/lazy load` and stub `/cmd` / tools still work. Turn it back on with `/lazy auto on`.
 
 ### Add a new package later
 
@@ -413,20 +462,23 @@ Manual `/lazy load` and stub `/cmd` / tools still work. Turn back on with `/lazy
 4. Restart Pi
 5. `/lazy load some-name` or use its stubs
 
-Changes to package specs, stubs, shortcuts, or event triggers take effect after `/reload` or a process restart. `/lazy auto on|off` is the only configuration change applied immediately.
+Changes to package specs, stubs, shortcuts, or event triggers take effect after `/reload` or a
+process restart. `/lazy auto on|off` is the only configuration change applied immediately.
 
 ### Undo migrate for one package
 
-Edit `settings.json`: change that entry back to a plain string source (or remove `"extensions": []`), keep `"lazy": false` in `lazy.json`, then restart. Or restore from the `settings.json.bak.lazy-*` backup.
+Edit `settings.json`: change that entry back to a plain string source (or remove
+`"extensions": []`), keep `"lazy": false` in `lazy.json`, then restart. Or restore from the
+`settings.json.bak.lazy-*` backup.
 
 ## Troubleshooting
 
 | Symptom | What to do |
 | ------- | ---------- |
 | Everything still `eager` after install | Run `/lazy migrate`, then **fully restart** Pi (not only `/reload` if filters were just written) |
-| `/lazy load X` → “not module-lazy ready” | Migrate + restart; the package is still a plain string in `settings.packages` |
-| `/lazy load X` → “package not installed” | `pi install` that source; confirm it exists under `~/.pi/agent/npm/node_modules/…` |
-| `/lazy load X` → “unknown spec” | Add it to `lazy.json` (`name` + `source`); `/lazy list` shows known names |
+| `/lazy load X` → "not module-lazy ready" | Migrate + restart; the package is still a plain string in `settings.packages` |
+| `/lazy load X` → "package not installed" | `pi install` that source; confirm it exists under `~/.pi/agent/npm/node_modules/…` |
+| `/lazy load X` → "unknown spec" | Add it to `lazy.json` (`name` + `source`); `/lazy list` shows known names |
 | Stub `/web` does nothing useful | Ensure `"cmd": ["web"]` on the spec, package is `pending`, and migrate was applied |
 | Model never sees stub tools | List them under `"tools"`; after first stub call, have it invoke the real tool next turn |
 | Keywords never fire | `/lazy auto on`; keywords are case-insensitive **substrings** of the user prompt |
@@ -434,7 +486,7 @@ Edit `settings.json`: change that entry back to a plain string source (or remove
 | Broken settings after migrate | Restore `~/.pi/agent/settings.json.bak.lazy-<timestamp>` |
 | Want a clean slate mid-session | No unload in v1 — use `/reload` or restart Pi |
 
-Startup tip: if managed packages aren’t module-lazy yet, pi-lazy notifies once:
+Startup tip: if managed packages aren't module-lazy yet, pi-lazy notifies you once:
 
 ```text
 pi-lazy: run /lazy migrate then restart for true module-lazy
@@ -443,10 +495,12 @@ pi-lazy: run /lazy migrate then restart for true module-lazy
 ## Limits (v1)
 
 - **No mid-session unload** — loaded factories stay until `/reload` / process restart
-- A factory that fails after registering runtime state is marked **poisoned** and cannot be retried until restart
+- A factory that fails after registering runtime state is marked **poisoned** and cannot be
+  retried until restart
 - **Boot-critical packages** should stay `"lazy": false`
 - **Stub `cmd` / `tools` names must be declared** in the spec
-- **Skills / prompts** stay eager by default — only **extensions** are deferred via `extensions: []`
+- **Skills / prompts** stay eager by default — only **extensions** are deferred via
+  `extensions: []`
 - **Git-sourced packages** are not fully resolved in v1 unless you point `source` at a local path
 - Without migrate, managed specs remain eager and on-demand load asks you to migrate
 
@@ -482,7 +536,8 @@ Layout:
 
 ## Publish
 
-CI runs the hermetic test suite, typecheck, build, production dependency audit, and package-content verification on Node 20, 22, and 24.
+CI runs the hermetic test suite, typecheck, build, production dependency audit, and
+package-content verification on Node 20, 22, and 24.
 
 Releases publish to npm automatically when a version tag is pushed:
 
@@ -499,7 +554,8 @@ GitHub Actions (`.github/workflows/publish.yml`) will:
 2. Assert the tag matches `package.json` version
 3. `npm publish --access public --provenance`
 
-**Required secret:** repo `NPM_TOKEN` (npm automation/granular access token with publish rights for `@rahularya01`).
+**Required secret:** repo `NPM_TOKEN` (npm automation/granular access token with publish rights
+for `@rahularya01`).
 
 Manual publish (fallback):
 
