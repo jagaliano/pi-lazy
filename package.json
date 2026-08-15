@@ -1,6 +1,6 @@
 {
   "name": "@rahularya01/pi-lazy",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "LazyVim-style extension manager for Pi Coding Agent \u2014 load packages after start or on demand (cmd/tools/keywords).",
   "author": "Rahul Arya",
   "license": "MIT",

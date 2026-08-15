@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.8
+
+- Documentation: Improved README readability and onboarding with a table of contents, a clearer LazyVim analogy explanation, and streamlined usage sections.
+- CI: Drop Node 20 from CI test matrix due to upstream `@earendil-works/pi-coding-agent` devDependency requirement while keeping package runtime support at Node >=20.
+
 ## 0.2.7
 
 - Coalesce concurrent loads, reject dependency cycles, and prevent retries after partial factory activation.
