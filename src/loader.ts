@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { LoadResult, ResolvedEntry } from "./types.ts";
+import type { ExtensionFactory, LoadResult, ResolvedEntry } from "./types.ts";
 
 type AnyHandler = (event: any, ctx: ExtensionContext) => any;
 
@@ -356,6 +356,49 @@ function createTrackingApi(pi: ExtensionAPI, track: LoadTrack): ExtensionAPI {
 	}) as ExtensionAPI;
 }
 
+async function importEntryFactories(entry: ResolvedEntry): Promise<ExtensionFactory[]> {
+	const factories: ExtensionFactory[] = [];
+	for (const extPath of entry.extensionPaths) {
+		const factory = await importFactory(extPath);
+		if (!factory) throw new Error(`Extension does not export a default factory: ${extPath}`);
+		factories.push(factory);
+	}
+	return factories;
+}
+
+/**
+ * Import an entry's modules without activating it.
+ *
+ * Importing is the expensive half of a load (transform plus module-graph
+ * evaluation) and it touches nothing but the module registry, so it may overlap
+ * with another entry's activation. Running factories stays strictly serial —
+ * only the import is moved off the critical path.
+ *
+ * A failure here happened before any factory ran, so nothing was mutated: the
+ * prefetch is simply dropped and the real load re-imports and reports the error.
+ */
+export function prefetchEntry(entry: ResolvedEntry): Promise<void> {
+	if (entry.prefetchPromise) return entry.prefetchPromise;
+	if (entry.prefetchedFactories) return Promise.resolve();
+	if (entry.state !== "pending" || !entry.moduleLazyReady) return Promise.resolve();
+	if (!entry.packageRoot || entry.extensionPaths.length === 0) return Promise.resolve();
+
+	const started = Date.now();
+	const promise = importEntryFactories(entry)
+		.then((factories) => {
+			entry.prefetchedFactories = factories;
+			entry.prefetchMs = Date.now() - started;
+		})
+		.catch(() => {
+			entry.prefetchedFactories = undefined;
+		})
+		.finally(() => {
+			if (entry.prefetchPromise === promise) entry.prefetchPromise = undefined;
+		});
+	entry.prefetchPromise = promise;
+	return promise;
+}
+
 /**
  * Load a resolved lazy package into the live host ExtensionAPI.
  */
@@ -437,12 +480,11 @@ export async function loadResolvedEntry(
 			}
 
 			// Import every entrypoint before allowing any factory to mutate the live API.
-			const factories: Array<(api: ExtensionAPI) => unknown> = [];
-			for (const extPath of entry.extensionPaths) {
-				const factory = await importFactory(extPath);
-				if (!factory) throw new Error(`Extension does not export a default factory: ${extPath}`);
-				factories.push(factory);
-			}
+			// A prefetch may already have done this, or may still be in flight — wait
+			// for it rather than transforming the same modules a second time.
+			if (entry.prefetchPromise) await entry.prefetchPromise;
+			const factories = entry.prefetchedFactories ?? (await importEntryFactories(entry));
+			entry.prefetchedFactories = undefined;
 			for (const factory of factories) {
 				activationStarted = true;
 				await factory(api);

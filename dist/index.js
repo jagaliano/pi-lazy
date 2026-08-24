@@ -18,6 +18,7 @@ import {
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 var CONFIG_VERSION = 1;
+var DEFAULT_AFTER_START_INITIAL_DELAY_MS = 750;
 function getLazyConfigPath(agentDir = getAgentDir()) {
   return join(agentDir, "lazy.json");
 }
@@ -32,6 +33,10 @@ function defaultConfig() {
     autoLoadLimit: 1,
     afterStartBatchSize: 1,
     afterStartDelayMs: 0,
+    afterStartInitialDelayMs: DEFAULT_AFTER_START_INITIAL_DELAY_MS,
+    afterStartPauseDuringTurn: true,
+    afterStartAdaptiveYield: true,
+    afterStartPrefetch: true,
     specs: [
       // Providers / always-on identity
       { name: "grok-cli", source: "npm:pi-grok-cli", lazy: false, description: "Grok CLI provider" },
@@ -130,6 +135,9 @@ function normalizePositiveInteger(value, fallback) {
 }
 function normalizeNonNegativeInteger(value, fallback) {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+function normalizeBoolean(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
 }
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -289,6 +297,13 @@ function loadConfig(agentDir = getAgentDir()) {
       autoLoadLimit: normalizePositiveInteger(raw.autoLoadLimit, 1),
       afterStartBatchSize: normalizePositiveInteger(raw.afterStartBatchSize, 1),
       afterStartDelayMs: normalizeNonNegativeInteger(raw.afterStartDelayMs, 0),
+      afterStartInitialDelayMs: normalizeNonNegativeInteger(
+        raw.afterStartInitialDelayMs,
+        DEFAULT_AFTER_START_INITIAL_DELAY_MS
+      ),
+      afterStartPauseDuringTurn: normalizeBoolean(raw.afterStartPauseDuringTurn, true),
+      afterStartAdaptiveYield: normalizeBoolean(raw.afterStartAdaptiveYield, true),
+      afterStartPrefetch: normalizeBoolean(raw.afterStartPrefetch, true),
       specs
     };
   } catch (err) {
@@ -585,6 +600,32 @@ function createTrackingApi(pi, track) {
     }
   });
 }
+async function importEntryFactories(entry) {
+  const factories = [];
+  for (const extPath of entry.extensionPaths) {
+    const factory = await importFactory(extPath);
+    if (!factory) throw new Error(`Extension does not export a default factory: ${extPath}`);
+    factories.push(factory);
+  }
+  return factories;
+}
+function prefetchEntry(entry) {
+  if (entry.prefetchPromise) return entry.prefetchPromise;
+  if (entry.prefetchedFactories) return Promise.resolve();
+  if (entry.state !== "pending" || !entry.moduleLazyReady) return Promise.resolve();
+  if (!entry.packageRoot || entry.extensionPaths.length === 0) return Promise.resolve();
+  const started = Date.now();
+  const promise = importEntryFactories(entry).then((factories) => {
+    entry.prefetchedFactories = factories;
+    entry.prefetchMs = Date.now() - started;
+  }).catch(() => {
+    entry.prefetchedFactories = void 0;
+  }).finally(() => {
+    if (entry.prefetchPromise === promise) entry.prefetchPromise = void 0;
+  });
+  entry.prefetchPromise = promise;
+  return promise;
+}
 async function loadResolvedEntry(entry, pi, ctx, deps) {
   const { spec } = entry;
   const ancestry = deps.ancestry ?? [];
@@ -649,12 +690,9 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
           throw new Error(`dependency ${dep} failed: ${depResult.error}`);
         }
       }
-      const factories = [];
-      for (const extPath of entry.extensionPaths) {
-        const factory = await importFactory(extPath);
-        if (!factory) throw new Error(`Extension does not export a default factory: ${extPath}`);
-        factories.push(factory);
-      }
+      if (entry.prefetchPromise) await entry.prefetchPromise;
+      const factories = entry.prefetchedFactories ?? await importEntryFactories(entry);
+      entry.prefetchedFactories = void 0;
       for (const factory of factories) {
         activationStarted = true;
         await factory(api);
@@ -1004,6 +1042,34 @@ function migrateSettings(agentDir = getAgentDir3()) {
 // src/index.ts
 import { performance } from "node:perf_hooks";
 import { copyFileSync as copyFileSync2, existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+var MAX_ADAPTIVE_YIELD_MS = 250;
+var PAUSE_TIMEOUT_MS = 6e4;
+function sleep(ms) {
+  return new Promise((resolve2) => {
+    setTimeout(resolve2, ms);
+  });
+}
+function drainResumeWaiters(rt) {
+  const waiters = rt.resumeWaiters;
+  rt.resumeWaiters = [];
+  for (const resolve2 of waiters) resolve2();
+}
+function waitWhilePaused(rt, generation) {
+  if (!rt.turnActive) return Promise.resolve();
+  if (rt.queueCancelled || generation !== rt.sessionGeneration) return Promise.resolve();
+  return new Promise((resolve2) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve2();
+    };
+    const timer = setTimeout(finish, PAUSE_TIMEOUT_MS);
+    timer.unref?.();
+    rt.resumeWaiters.push(finish);
+  });
+}
 function readSettingsPackages(agentDir) {
   const path = getSettingsPath(agentDir);
   if (!existsSync5(path)) return [];
@@ -1074,6 +1140,35 @@ function recordTiming(rt, label, started) {
   rt.profile.push({ label, ms: performance.now() - started });
   if (rt.profile.length > 100) rt.profile.shift();
 }
+function ensureResolved(rt, entry, ctx) {
+  if (entry.resolveAttempted) return true;
+  const started = performance.now();
+  try {
+    const resolved = resolveSpecPaths(entry.spec, getAgentDir4(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
+    entry.packageRoot = resolved.packageRoot ?? "";
+    entry.extensionPaths = resolved.extensionPaths;
+    entry.resolveMs = performance.now() - started;
+    entry.resolveAttempted = true;
+    recordTiming(rt, `resolve:${entry.spec.name}`, started);
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    entry.resolveAttempted = true;
+    entry.state = "error";
+    entry.error = `failed to resolve ${entry.spec.source}: ${message}`;
+    return false;
+  }
+}
+async function prefetchQuietly(rt, entry, ctx) {
+  try {
+    if (entry.state !== "pending" || !entry.moduleLazyReady) return;
+    if (!ensureResolved(rt, entry, ctx)) return;
+    const started = performance.now();
+    await prefetchEntry(entry);
+    if (entry.prefetchedFactories) recordTiming(rt, `prefetch:${entry.spec.name}`, started);
+  } catch {
+  }
+}
 async function loadByName(pi, rt, name, ctx, ancestry = []) {
   const key = name.trim();
   if (!key) return { ok: false, name: key, error: "spec name must not be empty" };
@@ -1091,20 +1186,8 @@ async function loadByName(pi, rt, name, ctx, ancestry = []) {
       error: void 0
     };
   }
-  if (!entry.packageRoot && entry.extensionPaths.length === 0) {
-    const started2 = performance.now();
-    try {
-      const resolved = resolveSpecPaths(entry.spec, getAgentDir4(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
-      entry.packageRoot = resolved.packageRoot ?? "";
-      entry.extensionPaths = resolved.extensionPaths;
-      entry.resolveMs = performance.now() - started2;
-      recordTiming(rt, `resolve:${entry.spec.name}`, started2);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      entry.state = "error";
-      entry.error = `failed to resolve ${entry.spec.source}: ${message}`;
-      return { ok: false, name: entry.spec.name, error: entry.error };
-    }
+  if (!ensureResolved(rt, entry, ctx)) {
+    return { ok: false, name: entry.spec.name, error: entry.error };
   }
   const started = performance.now();
   const result = await loadResolvedEntry(entry, pi, ctx ?? rt.sessionCtx, {
@@ -1229,6 +1312,7 @@ function registerEventTriggers(pi, rt) {
     }
   };
   pi.on("before_agent_start", async (event, ctx) => {
+    rt.turnActive = true;
     if (!rt.auto) return;
     const prompt = (event.prompt ?? "").toLowerCase();
     const toLoad = /* @__PURE__ */ new Set();
@@ -1261,18 +1345,32 @@ async function runAfterStart(pi, rt, ctx, generation) {
   const queue = [...rt.entries.values()].filter((e) => e.state === "pending" && e.spec.lazy === "after-start").sort((a, b) => (a.spec.priority ?? 100) - (b.spec.priority ?? 100));
   const batchSize = rt.config.afterStartBatchSize ?? 1;
   const delayMs = rt.config.afterStartDelayMs ?? 0;
-  for (let i = 0; i < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration; i += batchSize) {
-    for (const entry of queue.slice(i, i + batchSize)) {
-      if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
+  const adaptive = rt.config.afterStartAdaptiveYield !== false;
+  const prefetch = rt.config.afterStartPrefetch !== false;
+  const stale = () => rt.queueCancelled || generation !== rt.sessionGeneration;
+  for (let i = 0; i < queue.length && !stale(); i += batchSize) {
+    await waitWhilePaused(rt, generation);
+    if (stale()) return;
+    const batch = queue.slice(i, i + batchSize);
+    const next = queue.slice(i + batchSize, i + batchSize * 2);
+    if (prefetch) {
+      for (const entry of next) void prefetchQuietly(rt, entry, rt.sessionCtx ?? ctx);
+    }
+    let blockedMs = 0;
+    for (const entry of batch) {
+      if (stale()) return;
       const current = rt.sessionCtx ?? ctx;
+      const started = performance.now();
       const res = await loadByName(pi, rt, entry.spec.name, current);
-      if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
+      blockedMs += performance.now() - started;
+      if (stale()) return;
       if (!res.ok) {
         notifySafe(rt.sessionCtx ?? current, `lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
       }
     }
-    if (i + batchSize < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration) {
-      await new Promise((resolve2) => setTimeout(resolve2, delayMs));
+    if (i + batchSize < queue.length && !stale()) {
+      const yieldMs = adaptive ? Math.max(delayMs, Math.min(Math.round(blockedMs), MAX_ADAPTIVE_YIELD_MS)) : delayMs;
+      await sleep(yieldMs);
     }
   }
   refreshStatus(pi, rt, rt.sessionCtx ?? ctx);
@@ -1307,16 +1405,34 @@ function createPiLazy(pi, agentDir = getAgentDir4()) {
     profile: [],
     queueCancelled: false,
     sessionGeneration: 0,
-    restartRequired: false
+    restartRequired: false,
+    turnActive: false,
+    resumeWaiters: []
   };
   recordTiming(rt, "catalog", catalogStarted);
   registerStubs(pi, rt);
   registerEventTriggers(pi, rt);
+  const endTurn = () => {
+    rt.turnActive = false;
+    drainResumeWaiters(rt);
+  };
+  try {
+    pi.on("agent_end", () => {
+      endTurn();
+    });
+    pi.on("agent_settled", () => {
+      endTurn();
+    });
+  } catch (err) {
+    console.error(`[pi-lazy] turn-end events unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
   pi.on("session_start", async (event, ctx) => {
     rt.sessionGeneration++;
     const generation = rt.sessionGeneration;
     rt.sessionCtx = ctx;
     rt.queueCancelled = false;
+    rt.turnActive = false;
+    drainResumeWaiters(rt);
     refreshStatus(pi, rt, ctx);
     const needsMigrate = [...rt.entries.values()].some(
       (e) => isManagedLazy(e.spec) && !e.moduleLazyReady
@@ -1325,6 +1441,7 @@ function createPiLazy(pi, agentDir = getAgentDir4()) {
       ctx.ui.notify("pi-lazy: run /lazy migrate then restart for true module-lazy", "info");
     }
     rt.afterStartQueued = true;
+    const initialDelayMs = rt.config.afterStartInitialDelayMs ?? DEFAULT_AFTER_START_INITIAL_DELAY_MS;
     setTimeout(() => {
       void runAfterStart(pi, rt, ctx, generation).catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
@@ -1333,13 +1450,15 @@ function createPiLazy(pi, agentDir = getAgentDir4()) {
       }).finally(() => {
         if (generation === rt.sessionGeneration) rt.afterStartQueued = false;
       });
-    }, 0);
+    }, initialDelayMs);
   });
   pi.on("session_shutdown", () => {
     rt.sessionGeneration++;
     rt.sessionCtx = void 0;
     rt.afterStartQueued = false;
     rt.queueCancelled = true;
+    rt.turnActive = false;
+    drainResumeWaiters(rt);
   });
   pi.registerCommand("lazy", {
     description: "LazyVim-style extension manager (list|load|migrate|auto|init|status)",

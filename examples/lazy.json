@@ -7,6 +7,10 @@
   "autoLoadLimit": 1,
   "afterStartBatchSize": 1,
   "afterStartDelayMs": 0,
+  "afterStartInitialDelayMs": 750,
+  "afterStartPauseDuringTurn": true,
+  "afterStartAdaptiveYield": true,
+  "afterStartPrefetch": true,
   "specs": [
     {
       "name": "grok-cli",

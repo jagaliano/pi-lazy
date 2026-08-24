@@ -11,8 +11,15 @@
 
 import { Type } from "typebox";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isManagedLazy, loadConfig, saveConfig, defaultConfig, getLazyConfigPath } from "./config.ts";
-import { loadResolvedEntry } from "./loader.ts";
+import {
+	DEFAULT_AFTER_START_INITIAL_DELAY_MS,
+	defaultConfig,
+	getLazyConfigPath,
+	isManagedLazy,
+	loadConfig,
+	saveConfig,
+} from "./config.ts";
+import { loadResolvedEntry, prefetchEntry } from "./loader.ts";
 import { migrateSettings } from "./migrate.ts";
 import { isModuleLazyInSettings, resolveSpecPaths } from "./resolve.ts";
 import { performance } from "node:perf_hooks";
@@ -31,6 +38,52 @@ interface Runtime {
 	queueCancelled: boolean;
 	sessionGeneration: number;
 	restartRequired: boolean;
+	/** True between before_agent_start and agent_end/agent_settled. */
+	turnActive: boolean;
+	/** Resolvers for after-start slices parked until the current turn finishes. */
+	resumeWaiters: Array<() => void>;
+}
+
+/** Upper bound on one adaptive yield, so a slow package cannot stall the queue. */
+const MAX_ADAPTIVE_YIELD_MS = 250;
+
+/** Failsafe in case the host never emits a turn-end event for a started turn. */
+const PAUSE_TIMEOUT_MS = 60_000;
+
+function sleep(ms: number): Promise<void> {
+	return new Promise<void>((resolve) => {
+		setTimeout(resolve, ms);
+	});
+}
+
+function drainResumeWaiters(rt: Runtime) {
+	const waiters = rt.resumeWaiters;
+	rt.resumeWaiters = [];
+	for (const resolve of waiters) resolve();
+}
+
+/**
+ * Park the after-start queue while the agent is working.
+ *
+ * Activating a package is mostly synchronous CPU, so a slice that runs during a
+ * turn stalls streaming output and keystroke handling. Waiting costs nothing —
+ * these packages are deferred by definition.
+ */
+function waitWhilePaused(rt: Runtime, generation: number): Promise<void> {
+	if (!rt.turnActive) return Promise.resolve();
+	if (rt.queueCancelled || generation !== rt.sessionGeneration) return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		let settled = false;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve();
+		};
+		const timer = setTimeout(finish, PAUSE_TIMEOUT_MS);
+		timer.unref?.();
+		rt.resumeWaiters.push(finish);
+	});
 }
 
 function readSettingsPackages(agentDir: string): unknown[] {
@@ -123,6 +176,47 @@ function recordTiming(rt: Runtime, label: string, started: number) {
 	if (rt.profile.length > 100) rt.profile.shift();
 }
 
+/**
+ * Resolve package metadata on first use, not during startup catalog creation.
+ * Returns false only when resolution threw; a package that is simply not
+ * installed resolves to empty paths and is reported later by the loader.
+ */
+function ensureResolved(rt: Runtime, entry: ResolvedEntry, ctx?: ExtensionContext): boolean {
+	if (entry.resolveAttempted) return true;
+	const started = performance.now();
+	try {
+		const resolved = resolveSpecPaths(entry.spec, getAgentDir(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
+		entry.packageRoot = resolved.packageRoot ?? "";
+		entry.extensionPaths = resolved.extensionPaths;
+		entry.resolveMs = performance.now() - started;
+		entry.resolveAttempted = true;
+		recordTiming(rt, `resolve:${entry.spec.name}`, started);
+		return true;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		entry.resolveAttempted = true;
+		entry.state = "error";
+		entry.error = `failed to resolve ${entry.spec.source}: ${message}`;
+		return false;
+	}
+}
+
+/**
+ * Import an upcoming entry's modules while the current one activates. Purely an
+ * optimization: any failure is swallowed here and re-surfaced by the real load.
+ */
+async function prefetchQuietly(rt: Runtime, entry: ResolvedEntry, ctx?: ExtensionContext) {
+	try {
+		if (entry.state !== "pending" || !entry.moduleLazyReady) return;
+		if (!ensureResolved(rt, entry, ctx)) return;
+		const started = performance.now();
+		await prefetchEntry(entry);
+		if (entry.prefetchedFactories) recordTiming(rt, `prefetch:${entry.spec.name}`, started);
+	} catch {
+		/* the real load re-imports and reports the error */
+	}
+}
+
 async function loadByName(
 	pi: ExtensionAPI,
 	rt: Runtime,
@@ -152,21 +246,8 @@ async function loadByName(
 		};
 	}
 
-	// Resolve package metadata only on first actual load, not during startup catalog creation.
-	if (!entry.packageRoot && entry.extensionPaths.length === 0) {
-		const started = performance.now();
-		try {
-			const resolved = resolveSpecPaths(entry.spec, getAgentDir(), (ctx ?? rt.sessionCtx)?.cwd ?? process.cwd());
-			entry.packageRoot = resolved.packageRoot ?? "";
-			entry.extensionPaths = resolved.extensionPaths;
-			entry.resolveMs = performance.now() - started;
-			recordTiming(rt, `resolve:${entry.spec.name}`, started);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			entry.state = "error";
-			entry.error = `failed to resolve ${entry.spec.source}: ${message}`;
-			return { ok: false, name: entry.spec.name, error: entry.error };
-		}
+	if (!ensureResolved(rt, entry, ctx)) {
+		return { ok: false, name: entry.spec.name, error: entry.error };
 	}
 	const started = performance.now();
 	const result = await loadResolvedEntry(entry, pi, ctx ?? rt.sessionCtx, {
@@ -312,6 +393,9 @@ function registerEventTriggers(pi: ExtensionAPI, rt: Runtime) {
 
 	// before_agent_start combines explicit event owners with keyword matches.
 	pi.on("before_agent_start", async (event, ctx) => {
+		// Set before the auto guard: the after-start queue must back off during a
+		// turn regardless of whether keyword auto-loading is enabled.
+		rt.turnActive = true;
 		if (!rt.auto) return;
 		const prompt = (event.prompt ?? "").toLowerCase();
 		const toLoad = new Set<string>();
@@ -352,22 +436,45 @@ async function runAfterStart(pi: ExtensionAPI, rt: Runtime, ctx: ExtensionContex
 
 	const batchSize = rt.config.afterStartBatchSize ?? 1;
 	const delayMs = rt.config.afterStartDelayMs ?? 0;
-	for (let i = 0; i < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration; i += batchSize) {
-		for (const entry of queue.slice(i, i + batchSize)) {
-			if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
-			// The ctx passed in was captured by session_start before the
-			// setTimeout(0) that scheduled this call; if the session was
-			// replaced/reloaded in that gap (or between iterations here),
-			// rt.sessionCtx already points at the fresh one.
+	const adaptive = rt.config.afterStartAdaptiveYield !== false;
+	const prefetch = rt.config.afterStartPrefetch !== false;
+	const stale = () => rt.queueCancelled || generation !== rt.sessionGeneration;
+
+	for (let i = 0; i < queue.length && !stale(); i += batchSize) {
+		await waitWhilePaused(rt, generation);
+		if (stale()) return;
+
+		const batch = queue.slice(i, i + batchSize);
+		const next = queue.slice(i + batchSize, i + batchSize * 2);
+		// Overlap the next slice's imports with this slice's activation. Factory
+		// execution below stays strictly serial and in priority order.
+		if (prefetch) {
+			for (const entry of next) void prefetchQuietly(rt, entry, rt.sessionCtx ?? ctx);
+		}
+
+		let blockedMs = 0;
+		for (const entry of batch) {
+			if (stale()) return;
+			// The ctx passed in was captured by session_start before the timer that
+			// scheduled this call; if the session was replaced/reloaded in that gap
+			// (or between iterations here), rt.sessionCtx already points at the fresh one.
 			const current = rt.sessionCtx ?? ctx;
+			const started = performance.now();
 			const res = await loadByName(pi, rt, entry.spec.name, current);
-			if (rt.queueCancelled || generation !== rt.sessionGeneration) return;
+			blockedMs += performance.now() - started;
+			if (stale()) return;
 			if (!res.ok) {
 				notifySafe(rt.sessionCtx ?? current, `lazy: after-start failed ${entry.spec.name}: ${res.error}`, "warning");
 			}
 		}
-		if (i + batchSize < queue.length && !rt.queueCancelled && generation === rt.sessionGeneration) {
-			await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+
+		if (i + batchSize < queue.length && !stale()) {
+			// Give the UI back at least as much time as the slice took from it,
+			// capped so a pathologically slow package cannot stall the whole queue.
+			const yieldMs = adaptive
+				? Math.max(delayMs, Math.min(Math.round(blockedMs), MAX_ADAPTIVE_YIELD_MS))
+				: delayMs;
+			await sleep(yieldMs);
 		}
 	}
 	refreshStatus(pi, rt, rt.sessionCtx ?? ctx);
@@ -406,16 +513,40 @@ export function createPiLazy(pi: ExtensionAPI, agentDir = getAgentDir()) {
 		queueCancelled: false,
 		sessionGeneration: 0,
 		restartRequired: false,
+		turnActive: false,
+		resumeWaiters: [],
 	};
 	recordTiming(rt, "catalog", catalogStarted);
 	registerStubs(pi, rt);
 	registerEventTriggers(pi, rt);
+
+	const endTurn = () => {
+		rt.turnActive = false;
+		drainResumeWaiters(rt);
+	};
+	// agent_settled is the later of the two; agent_end covers hosts that never
+	// settle (aborted or errored turns). Both are idempotent.
+	try {
+		pi.on("agent_end", () => {
+			endTurn();
+		});
+		pi.on("agent_settled", () => {
+			endTurn();
+		});
+	} catch (err) {
+		// An older host without these events simply never pauses the queue.
+		console.error(`[pi-lazy] turn-end events unavailable: ${err instanceof Error ? err.message : String(err)}`);
+	}
 
 	pi.on("session_start", async (event, ctx) => {
 		rt.sessionGeneration++;
 		const generation = rt.sessionGeneration;
 		rt.sessionCtx = ctx;
 		rt.queueCancelled = false;
+		rt.turnActive = false;
+		// Waiters parked by the previous session are now stale; release them so
+		// they exit on their generation check.
+		drainResumeWaiters(rt);
 		refreshStatus(pi, rt, ctx);
 
 		const needsMigrate = [...rt.entries.values()].some(
@@ -428,6 +559,7 @@ export function createPiLazy(pi: ExtensionAPI, agentDir = getAgentDir()) {
 		rt.afterStartQueued = true;
 		// VeryLazy: yield so first paint / prompt isn't blocked. A generation token
 		// makes older scheduled work harmless if sessions change in the meantime.
+		const initialDelayMs = rt.config.afterStartInitialDelayMs ?? DEFAULT_AFTER_START_INITIAL_DELAY_MS;
 		setTimeout(() => {
 			void runAfterStart(pi, rt, ctx, generation)
 				.catch((err) => {
@@ -438,7 +570,7 @@ export function createPiLazy(pi: ExtensionAPI, agentDir = getAgentDir()) {
 				.finally(() => {
 					if (generation === rt.sessionGeneration) rt.afterStartQueued = false;
 				});
-		}, 0);
+		}, initialDelayMs);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -446,6 +578,10 @@ export function createPiLazy(pi: ExtensionAPI, agentDir = getAgentDir()) {
 		rt.sessionCtx = undefined;
 		rt.afterStartQueued = false;
 		rt.queueCancelled = true;
+		rt.turnActive = false;
+		// Release parked slices so they observe the cancellation instead of
+		// holding their timers until the pause failsafe fires.
+		drainResumeWaiters(rt);
 	});
 
 	pi.registerCommand("lazy", {

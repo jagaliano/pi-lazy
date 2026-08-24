@@ -238,6 +238,10 @@ Here's a full example (also in [`examples/lazy.json`](./examples/lazy.json)):
   "autoLoadLimit": 1,
   "afterStartBatchSize": 1,
   "afterStartDelayMs": 0,
+  "afterStartInitialDelayMs": 750,
+  "afterStartPauseDuringTurn": true,
+  "afterStartAdaptiveYield": true,
+  "afterStartPrefetch": true,
   "specs": [
     {
       "name": "cursor",
@@ -282,8 +286,35 @@ Here's a full example (also in [`examples/lazy.json`](./examples/lazy.json)):
 | `auto` | boolean | Enable keyword/event auto-load (default: `true`) |
 | `autoLoadLimit` | integer | Maximum packages loaded before one agent turn (default: `1`) |
 | `afterStartBatchSize` | integer | Packages loaded in one after-start event-loop slice (default: `1`) |
-| `afterStartDelayMs` | integer | Delay between after-start slices in milliseconds (default: `0`) |
+| `afterStartDelayMs` | integer | Minimum delay between after-start slices in milliseconds (default: `0`) |
+| `afterStartInitialDelayMs` | integer | Delay before the after-start queue starts, in milliseconds (default: `750`) |
+| `afterStartPauseDuringTurn` | boolean | Hold the after-start queue while the agent is working (default: `true`) |
+| `afterStartAdaptiveYield` | boolean | Yield at least as long as the previous slice blocked the event loop, capped at 250 ms (default: `true`) |
+| `afterStartPrefetch` | boolean | Import the next slice's modules while the current one activates (default: `true`) |
 | `specs` | array | Package load catalog |
+
+### Keeping startup smooth
+
+Loading an extension is mostly synchronous work — transforming TypeScript and
+evaluating a module graph — so it blocks the event loop for as long as it takes,
+no matter how the queue is sliced. pi-lazy therefore concentrates on *when* that
+work happens rather than trying to make it cheaper:
+
+- **It doesn't start immediately.** `afterStartInitialDelayMs` keeps the queue
+  clear of Pi's first paint and of your first keystrokes.
+- **It stops while you're working.** With `afterStartPauseDuringTurn`, the queue
+  parks at `before_agent_start` and resumes at `agent_end` / `agent_settled`, so
+  it never competes with streaming output.
+- **It gives time back.** `afterStartAdaptiveYield` sleeps for as long as the
+  previous slice ran (up to 250 ms), so heavy packages yield more than light ones.
+- **It overlaps what it can.** `afterStartPrefetch` imports the next slice's
+  modules while the current one activates. Factory execution stays strictly
+  serial and in `priority` order.
+
+If startup still feels slow, the fix is usually the catalog rather than these
+knobs: run `/lazy profile` to see per-package load times, then move the expensive
+packages from `"after-start"` to `true` and give them `cmd` / `tools` / `keywords`
+triggers so they load on first real use instead.
 
 ### Spec fields
 

@@ -2,6 +2,10 @@
  * LazyVim-style extension load specs for Pi.
  */
 
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export type ExtensionFactory = (api: ExtensionAPI) => unknown;
+
 export type LazyMode = false | true | "after-start";
 
 export type SpecState = "eager" | "pending" | "loading" | "loaded" | "error" | "poisoned";
@@ -48,6 +52,14 @@ export interface LazyConfig {
 	afterStartBatchSize?: number;
 	/** Delay between after-start slices in milliseconds (default 0). */
 	afterStartDelayMs?: number;
+	/** Delay before the after-start queue starts, in milliseconds (default 750). */
+	afterStartInitialDelayMs?: number;
+	/** Hold the after-start queue while an agent turn is running (default true). */
+	afterStartPauseDuringTurn?: boolean;
+	/** Yield at least as long as the previous slice blocked the event loop (default true). */
+	afterStartAdaptiveYield?: boolean;
+	/** Import the next slice's modules while the current slice activates (default true). */
+	afterStartPrefetch?: boolean;
 	specs: LazySpec[];
 }
 
@@ -69,6 +81,13 @@ export interface ResolvedEntry {
 	loadedCommandHandlers?: Map<string, (args: string, ctx: any) => Promise<void>>;
 	/** Shared by every caller while this entry is being loaded. */
 	loadPromise?: Promise<LoadResult>;
+	/** True once package resolution ran, so a miss is not rescanned every trigger. */
+	resolveAttempted?: boolean;
+	/** Factories imported ahead of activation by the after-start prefetcher. */
+	prefetchedFactories?: ExtensionFactory[];
+	/** In-flight prefetch import, awaited by a real load that overtakes it. */
+	prefetchPromise?: Promise<void>;
+	prefetchMs?: number;
 	/** Normalized once during catalog construction for prompt matching. */
 	normalizedKeywords?: string[];
 }

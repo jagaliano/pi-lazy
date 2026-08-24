@@ -16,6 +16,14 @@ import type { LazyConfig, LazyMode, LazySpec } from "./types.ts";
 
 export const CONFIG_VERSION = 1 as const;
 
+/**
+ * The after-start queue competes with Pi's first paint and with the user typing
+ * their first prompt, so it waits before starting. Loading a heavy extension is
+ * mostly synchronous CPU (transform + module evaluation), which blocks the event
+ * loop no matter how the queue is sliced — the only cure is to not start early.
+ */
+export const DEFAULT_AFTER_START_INITIAL_DELAY_MS = 750;
+
 export function getLazyConfigPath(agentDir = getAgentDir()): string {
 	return join(agentDir, "lazy.json");
 }
@@ -32,6 +40,10 @@ export function defaultConfig(): LazyConfig {
 		autoLoadLimit: 1,
 		afterStartBatchSize: 1,
 		afterStartDelayMs: 0,
+		afterStartInitialDelayMs: DEFAULT_AFTER_START_INITIAL_DELAY_MS,
+		afterStartPauseDuringTurn: true,
+		afterStartAdaptiveYield: true,
+		afterStartPrefetch: true,
 		specs: [
 			// Providers / always-on identity
 			{ name: "grok-cli", source: "npm:pi-grok-cli", lazy: false, description: "Grok CLI provider" },
@@ -135,6 +147,10 @@ function normalizePositiveInteger(value: unknown, fallback: number): number {
 
 function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -312,6 +328,13 @@ export function loadConfig(agentDir = getAgentDir()): LazyConfig {
 			autoLoadLimit: normalizePositiveInteger(raw.autoLoadLimit, 1),
 			afterStartBatchSize: normalizePositiveInteger(raw.afterStartBatchSize, 1),
 			afterStartDelayMs: normalizeNonNegativeInteger(raw.afterStartDelayMs, 0),
+			afterStartInitialDelayMs: normalizeNonNegativeInteger(
+				raw.afterStartInitialDelayMs,
+				DEFAULT_AFTER_START_INITIAL_DELAY_MS,
+			),
+			afterStartPauseDuringTurn: normalizeBoolean(raw.afterStartPauseDuringTurn, true),
+			afterStartAdaptiveYield: normalizeBoolean(raw.afterStartAdaptiveYield, true),
+			afterStartPrefetch: normalizeBoolean(raw.afterStartPrefetch, true),
 			specs,
 		};
 	} catch (err) {

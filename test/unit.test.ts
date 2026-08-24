@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config.ts";
 import { createPiLazy } from "../src/index.ts";
-import { loadResolvedEntry } from "../src/loader.ts";
+import { loadResolvedEntry, prefetchEntry } from "../src/loader.ts";
 import { migrateSettings } from "../src/migrate.ts";
 import { isModuleLazyInSettings, resolveExtensionEntries } from "../src/resolve.ts";
 import type { LazySpec, LoadResult, ResolvedEntry } from "../src/types.ts";
@@ -218,7 +218,12 @@ test("loaded factories survive later sessions without duplicate activation", asy
 	createPackage(pkg, {
 		"index.mjs": `export default function(pi){ globalThis.__piLazySessions=(globalThis.__piLazySessions||0)+1; pi.on("session_start",()=>{}); }`,
 	});
-	writeJson(join(agent, "lazy.json"), { version: 1, afterStartDelayMs: 0, specs: [{ name: "pkg", source: pkg, lazy: "after-start" }] });
+	writeJson(join(agent, "lazy.json"), {
+		version: 1,
+		afterStartDelayMs: 0,
+		afterStartInitialDelayMs: 0,
+		specs: [{ name: "pkg", source: pkg, lazy: "after-start" }],
+	});
 	writeJson(join(agent, "settings.json"), { packages: [{ source: pkg, extensions: [] }] });
 	(globalThis as any).__piLazySessions = 0;
 	const pi = mockPi();
@@ -270,4 +275,83 @@ test("custom event names trigger configured packages", async () => {
 	createPiLazy(pi.api, agent);
 	await pi.emit("custom_event", { type: "custom_event" });
 	assert.equal((globalThis as any).__piLazyEvent, 1);
+});
+
+test("the after-start queue waits for the initial delay before loading", async () => {
+	const agent = tempDir();
+	const pkg = join(agent, "pkg");
+	createPackage(pkg, { "index.mjs": "export default function(){ globalThis.__piLazyDelayed=(globalThis.__piLazyDelayed||0)+1; }" });
+	writeJson(join(agent, "lazy.json"), {
+		version: 1,
+		afterStartInitialDelayMs: 200,
+		specs: [{ name: "pkg", source: pkg, lazy: "after-start" }],
+	});
+	writeJson(join(agent, "settings.json"), { packages: [{ source: pkg, extensions: [] }] });
+	(globalThis as any).__piLazyDelayed = 0;
+	const pi = mockPi();
+	createPiLazy(pi.api, agent);
+	await pi.emit("session_start", { type: "session_start", reason: "startup" });
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	assert.equal((globalThis as any).__piLazyDelayed, 0, "must not load during the initial delay");
+	await waitFor(() => (globalThis as any).__piLazyDelayed === 1, 2_000);
+});
+
+test("the after-start queue is held for the duration of an agent turn", async () => {
+	const agent = tempDir();
+	const pkg = join(agent, "pkg");
+	createPackage(pkg, { "index.mjs": "export default function(){ globalThis.__piLazyTurn=(globalThis.__piLazyTurn||0)+1; }" });
+	writeJson(join(agent, "lazy.json"), {
+		version: 1,
+		afterStartInitialDelayMs: 50,
+		specs: [{ name: "pkg", source: pkg, lazy: "after-start" }],
+	});
+	writeJson(join(agent, "settings.json"), { packages: [{ source: pkg, extensions: [] }] });
+	(globalThis as any).__piLazyTurn = 0;
+	const pi = mockPi();
+	createPiLazy(pi.api, agent);
+	await pi.emit("session_start", { type: "session_start", reason: "startup" });
+	// The user types straight away: the turn opens inside the initial delay,
+	// before the queue's first slice gets to run.
+	await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "hello" });
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal((globalThis as any).__piLazyTurn, 0, "must not load while a turn is active");
+	await pi.emit("agent_end", { type: "agent_end" });
+	await waitFor(() => (globalThis as any).__piLazyTurn === 1);
+});
+
+test("prefetched factories activate exactly once", async () => {
+	const agent = tempDir();
+	const pkg = join(agent, "pkg");
+	createPackage(pkg, { "index.mjs": "export default function(){ globalThis.__piLazyPrefetch=(globalThis.__piLazyPrefetch||0)+1; }" });
+	(globalThis as any).__piLazyPrefetch = 0;
+	const entry = resolvedEntry({ name: "pkg", source: pkg, lazy: true }, pkg, [join(pkg, "index.mjs")]);
+	const pi = mockPi();
+
+	await prefetchEntry(entry);
+	assert.equal(entry.prefetchedFactories?.length, 1, "prefetch imports without activating");
+	assert.equal((globalThis as any).__piLazyPrefetch, 0);
+
+	const result = await loadResolvedEntry(entry, pi.api, undefined, {
+		loadDependency: async () => ({ ok: true, name: "noop" }) as LoadResult,
+	});
+	assert.equal(result.ok, true);
+	assert.equal((globalThis as any).__piLazyPrefetch, 1);
+	assert.equal(entry.prefetchedFactories, undefined, "prefetch is consumed by the load");
+});
+
+test("a load that overtakes an in-flight prefetch imports the module only once", async () => {
+	const agent = tempDir();
+	const pkg = join(agent, "pkg");
+	createPackage(pkg, { "index.mjs": "export default function(){ globalThis.__piLazyRace=(globalThis.__piLazyRace||0)+1; }" });
+	(globalThis as any).__piLazyRace = 0;
+	const entry = resolvedEntry({ name: "pkg", source: pkg, lazy: true }, pkg, [join(pkg, "index.mjs")]);
+	const pi = mockPi();
+
+	const prefetch = prefetchEntry(entry);
+	const load = loadResolvedEntry(entry, pi.api, undefined, {
+		loadDependency: async () => ({ ok: true, name: "noop" }) as LoadResult,
+	});
+	const [, result] = await Promise.all([prefetch, load]);
+	assert.equal(result.ok, true);
+	assert.equal((globalThis as any).__piLazyRace, 1);
 });

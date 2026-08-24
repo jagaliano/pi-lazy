@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0
+
+Startup responsiveness. The after-start queue previously began on a
+`setTimeout(0)` from `session_start` and then ran uninterrupted, so a stack of
+`"after-start"` packages loaded back to back while Pi was still painting and
+while the user was typing their first prompt. Activating an extension is mostly
+synchronous work (TypeScript transform plus module-graph evaluation), so each
+one blocked the event loop for its full duration.
+
+- **Delay the queue.** New `afterStartInitialDelayMs` (default `750`) keeps the
+  first slice clear of Pi's first paint and first keystrokes. Previously
+  hard-coded to `0`.
+- **Pause during agent turns.** New `afterStartPauseDuringTurn` (default `true`)
+  parks the queue at `before_agent_start` and resumes it at `agent_end` /
+  `agent_settled`, so loading never competes with streaming output. A 60 s
+  failsafe releases the queue if a host never reports the end of a turn.
+- **Adaptive yielding.** New `afterStartAdaptiveYield` (default `true`) sleeps
+  for as long as the previous slice blocked the event loop, capped at 250 ms, so
+  heavy packages give back more time than light ones. `afterStartDelayMs` is now
+  the floor rather than the whole delay.
+- **Overlap imports with activation.** New `afterStartPrefetch` (default `true`)
+  imports the next slice's modules while the current slice's factories run.
+  Factory execution remains strictly serial and in `priority` order; a prefetch
+  failure happens before any factory runs, so it is discarded and re-surfaced by
+  the real load.
+- Package resolution is now attempted once per entry instead of being rescanned
+  on every trigger for packages that are not installed.
+- All four new fields default to the documented values when absent, so existing
+  `lazy.json` files keep working untouched.
+
 ## 0.2.8
 
 - Documentation: Improved README readability and onboarding with a table of contents, a clearer LazyVim analogy explanation, and streamlined usage sections.
