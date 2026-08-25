@@ -5,25 +5,202 @@ import { getAgentDir as getAgentDir4 } from "@earendil-works/pi-coding-agent";
 // src/config.ts
 import {
   closeSync,
-  existsSync,
+  existsSync as existsSync2,
   fsyncSync,
   mkdirSync,
   openSync,
-  readFileSync,
+  readFileSync as readFileSync2,
   renameSync,
-  statSync,
+  statSync as statSync2,
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join as join2 } from "node:path";
+import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
+
+// src/resolve.ts
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+function isRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function safeIsDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function npmPackageName(source) {
+  if (source.startsWith("npm:")) {
+    const rest = source.slice(4);
+    if (rest.startsWith("@")) {
+      const m = rest.match(/^(@[^/]+\/[^@]+)/);
+      return m?.[1] ?? rest;
+    }
+    return rest.split("@")[0] ?? rest;
+  }
+  if (!source.includes(":") && !source.startsWith(".") && !source.startsWith("/")) {
+    return source.startsWith("@") ? source.match(/^(@[^/]+\/[^@]+)/)?.[1] ?? source : source.split("@")[0];
+  }
+  return null;
+}
+function npmPackageIdentity(source) {
+  const name = npmPackageName(source);
+  if (!name) return null;
+  const rest = source.startsWith("npm:") ? source.slice(4) : source;
+  const selector = rest.slice(name.length);
+  return { name, ...selector.startsWith("@") && selector.length > 1 ? { selector: selector.slice(1) } : {} };
+}
+function resolvePackageRoot(source, agentDir = getAgentDir(), cwd = process.cwd()) {
+  const npmName = npmPackageName(source);
+  if (npmName) {
+    const candidates = [
+      join(agentDir, "npm", "node_modules", npmName),
+      join(cwd, ".pi", "npm", "node_modules", npmName)
+    ];
+    for (const c of candidates) {
+      if (safeIsDirectory(c)) return c;
+    }
+    return null;
+  }
+  if (source.startsWith("git:") || source.startsWith("https://") || source.startsWith("http://") || source.startsWith("ssh://")) {
+    const gitRoot = join(agentDir, "git");
+    if (existsSync(gitRoot)) {
+    }
+    return null;
+  }
+  const local = resolve(cwd, source);
+  if (safeIsDirectory(local)) return local;
+  return null;
+}
+function readPiManifest(packageRoot) {
+  const pj = join(packageRoot, "package.json");
+  if (!existsSync(pj)) return null;
+  try {
+    const pkg = JSON.parse(readFileSync(pj, "utf-8"));
+    if (!isRecord(pkg) || !isRecord(pkg.pi)) return null;
+    const extensions = Array.isArray(pkg.pi.extensions) ? pkg.pi.extensions.filter((entry) => typeof entry === "string" && entry.length > 0) : void 0;
+    return { extensions };
+  } catch {
+    return null;
+  }
+}
+function isExtensionFile(name) {
+  return name.endsWith(".ts") || name.endsWith(".js") || name.endsWith(".mts") || name.endsWith(".mjs");
+}
+function resolveExtensionEntries(packageRoot) {
+  const manifest = readPiManifest(packageRoot);
+  if (manifest?.extensions?.length) {
+    const entries = [];
+    for (const extPath of manifest.extensions) {
+      const resolved = resolve(packageRoot, extPath);
+      const withinRoot = relative(packageRoot, resolved);
+      if (withinRoot === ".." || withinRoot.startsWith(`..${sep}`) || isAbsolute(withinRoot)) continue;
+      if (!existsSync(resolved)) continue;
+      let st;
+      try {
+        st = statSync(resolved);
+      } catch {
+        continue;
+      }
+      if (st.isFile() && isExtensionFile(resolved)) {
+        entries.push(resolved);
+        continue;
+      }
+      if (st.isDirectory()) {
+        const indexTs2 = join(resolved, "index.ts");
+        const indexJs2 = join(resolved, "index.js");
+        if (existsSync(indexTs2)) entries.push(indexTs2);
+        else if (existsSync(indexJs2)) entries.push(indexJs2);
+        else {
+          try {
+            for (const item of readdirSync(resolved, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+              if (item.isFile() && isExtensionFile(item.name)) {
+                entries.push(join(resolved, item.name));
+              }
+            }
+          } catch {
+          }
+        }
+      }
+    }
+    if (entries.length > 0) return entries;
+  }
+  const indexTs = join(packageRoot, "index.ts");
+  const indexJs = join(packageRoot, "index.js");
+  if (existsSync(indexTs)) return [indexTs];
+  if (existsSync(indexJs)) return [indexJs];
+  return [];
+}
+function resolveSpecPaths(spec, agentDir = getAgentDir(), cwd = process.cwd()) {
+  const packageRoot = resolvePackageRoot(spec.source, agentDir, cwd);
+  if (!packageRoot) {
+    return { packageRoot: null, extensionPaths: [] };
+  }
+  return {
+    packageRoot,
+    extensionPaths: resolveExtensionEntries(packageRoot)
+  };
+}
+function isModuleLazyInSettings(source, settingsPackages) {
+  const matches = [];
+  for (const entry of settingsPackages) {
+    if (typeof entry === "string") {
+      if (sourcesMatch(entry, source)) matches.push(entry);
+      continue;
+    }
+    if (entry && typeof entry === "object") {
+      const obj = entry;
+      if (typeof obj.source === "string" && sourcesMatch(obj.source, source)) matches.push(entry);
+    }
+  }
+  if (matches.length !== 1) return false;
+  const match = matches[0];
+  return !!match && typeof match === "object" && Array.isArray(match.extensions) && match.extensions.length === 0;
+}
+function normalizeSourceKey(source) {
+  const trimmed = source.trim();
+  const npm = npmPackageName(trimmed);
+  if (npm) return `npm:${trimmed.startsWith("npm:") ? trimmed.slice(4) : trimmed}`;
+  return trimmed;
+}
+function sourcesMatch(left, right) {
+  const leftNpm = npmPackageIdentity(left);
+  const rightNpm = npmPackageIdentity(right);
+  if (leftNpm || rightNpm) {
+    if (!leftNpm || !rightNpm || leftNpm.name !== rightNpm.name) return false;
+    return !leftNpm.selector || !rightNpm.selector || leftNpm.selector === rightNpm.selector;
+  }
+  return normalizeSourceKey(left) === normalizeSourceKey(right);
+}
+function findSettingsPackageIndex(settingsPackages, source) {
+  return findSettingsPackageIndices(settingsPackages, source)[0] ?? -1;
+}
+function findSettingsPackageIndices(settingsPackages, source) {
+  const indices = [];
+  settingsPackages.forEach((entry, index) => {
+    if (typeof entry === "string") {
+      if (sourcesMatch(entry, source)) indices.push(index);
+      return;
+    }
+    if (entry && typeof entry === "object" && typeof entry.source === "string") {
+      if (sourcesMatch(entry.source, source)) indices.push(index);
+      return;
+    }
+  });
+  return indices;
+}
+
+// src/config.ts
 var CONFIG_VERSION = 1;
 var DEFAULT_AFTER_START_INITIAL_DELAY_MS = 750;
-function getLazyConfigPath(agentDir = getAgentDir()) {
-  return join(agentDir, "lazy.json");
+function getLazyConfigPath(agentDir = getAgentDir2()) {
+  return join2(agentDir, "lazy.json");
 }
-function getSettingsPath(agentDir = getAgentDir()) {
-  return join(agentDir, "settings.json");
+function getSettingsPath(agentDir = getAgentDir2()) {
+  return join2(agentDir, "settings.json");
 }
 function defaultConfig() {
   return {
@@ -48,6 +225,7 @@ function defaultConfig() {
         source: "npm:pi-subagents",
         lazy: "after-start",
         priority: 10,
+        loadInSubagents: false,
         description: "Subagent orchestration"
       },
       {
@@ -139,7 +317,7 @@ function normalizeNonNegativeInteger(value, fallback) {
 function normalizeBoolean(value, fallback) {
   return typeof value === "boolean" ? value : fallback;
 }
-function isRecord(value) {
+function isRecord2(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 function normalizeStringArray(value, field, issues) {
@@ -161,7 +339,7 @@ function normalizeStringArray(value, field, issues) {
 }
 function normalizeSpec(value, index, defaultsLazy, issues) {
   const field = `specs[${index}]`;
-  if (!isRecord(value)) {
+  if (!isRecord2(value)) {
     issues.push(`${field} must be an object`);
     return null;
   }
@@ -186,12 +364,24 @@ function normalizeSpec(value, index, defaultsLazy, issues) {
   if (value.description !== void 0 && description === void 0) {
     issues.push(`${field}.description must be a string`);
   }
+  let loadInSubagents;
+  if (value.loadInSubagents !== void 0) {
+    if (typeof value.loadInSubagents === "boolean") {
+      loadInSubagents = value.loadInSubagents;
+    } else {
+      issues.push(`${field}.loadInSubagents must be a boolean`);
+      if (npmPackageName(source) === "pi-subagents") loadInSubagents = false;
+    }
+  } else if (npmPackageName(source) === "pi-subagents") {
+    loadInSubagents = false;
+  }
   return {
     name,
     source,
     lazy,
     ...priority === void 0 ? {} : { priority },
     ...description === void 0 ? {} : { description },
+    ...loadInSubagents === void 0 ? {} : { loadInSubagents },
     cmd: normalizeStringArray(value.cmd, `${field}.cmd`, issues),
     tools: normalizeStringArray(value.tools, `${field}.tools`, issues),
     keys: normalizeStringArray(value.keys, `${field}.keys`, issues),
@@ -208,7 +398,7 @@ function atomicWriteJson(path, value) {
   const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
   let fd;
   try {
-    const mode = existsSync(path) ? statSync(path).mode : 384;
+    const mode = existsSync2(path) ? statSync2(path).mode : 384;
     fd = openSync(tempPath, "wx", mode);
     writeFileSync(fd, `${JSON.stringify(value, null, 2)}
 `, "utf-8");
@@ -239,9 +429,9 @@ function atomicWriteJson(path, value) {
     throw err;
   }
 }
-function loadConfig(agentDir = getAgentDir()) {
+function loadConfig(agentDir = getAgentDir2()) {
   const path = getLazyConfigPath(agentDir);
-  if (!existsSync(path)) {
+  if (!existsSync2(path)) {
     const cfg = defaultConfig();
     try {
       saveConfig(cfg, agentDir);
@@ -252,16 +442,16 @@ function loadConfig(agentDir = getAgentDir()) {
     return cfg;
   }
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8"));
-    if (!isRecord(parsed)) throw new Error("root must be a JSON object");
+    const parsed = JSON.parse(readFileSync2(path, "utf-8"));
+    if (!isRecord2(parsed)) throw new Error("root must be a JSON object");
     const raw = parsed;
     const issues = [];
     const supportedVersion = raw.version === void 0 || raw.version === CONFIG_VERSION;
     if (!supportedVersion) {
       issues.push(`unsupported version ${String(raw.version)} (expected ${CONFIG_VERSION})`);
     }
-    const defaults = isRecord(raw.defaults) ? raw.defaults : {};
-    if (raw.defaults !== void 0 && !isRecord(raw.defaults)) issues.push("defaults must be an object");
+    const defaults = isRecord2(raw.defaults) ? raw.defaults : {};
+    if (raw.defaults !== void 0 && !isRecord2(raw.defaults)) issues.push("defaults must be an object");
     const defaultsLazy = normalizeMode(defaults.lazy, true);
     if (defaults.lazy !== void 0 && defaultsLazy === true && defaults.lazy !== true) {
       issues.push('defaults.lazy must be false, true, or "after-start"');
@@ -312,7 +502,7 @@ function loadConfig(agentDir = getAgentDir()) {
     return defaultConfig();
   }
 }
-function saveConfig(config, agentDir = getAgentDir()) {
+function saveConfig(config, agentDir = getAgentDir2()) {
   const path = getLazyConfigPath(agentDir);
   atomicWriteJson(path, config);
   return path;
@@ -322,9 +512,9 @@ function isManagedLazy(spec) {
 }
 
 // src/loader.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2, realpathSync } from "node:fs";
+import { existsSync as existsSync3, readFileSync as readFileSync3, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname as dirname2, join as join3 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 function fileUrl(path) {
   return pathToFileURL(path).href;
@@ -348,10 +538,10 @@ function resolvePiPackageJson() {
     const bin = realpathSync(process.argv[1] ?? "");
     let dir = dirname2(bin);
     for (let i = 0; i < 10; i++) {
-      const pkgPath = join2(dir, "package.json");
-      if (existsSync2(pkgPath)) {
+      const pkgPath = join3(dir, "package.json");
+      if (existsSync3(pkgPath)) {
         try {
-          const name = JSON.parse(readFileSync2(pkgPath, "utf-8")).name;
+          const name = JSON.parse(readFileSync3(pkgPath, "utf-8")).name;
           if (name === "@earendil-works/pi-coding-agent" || name === "@mariozechner/pi-coding-agent") {
             return finish(pkgPath);
           }
@@ -375,10 +565,10 @@ function resolvePiPackageJson() {
   } catch {
   }
   for (const guess of [
-    join2(dirname2(process.execPath), "../lib/node_modules/@earendil-works/pi-coding-agent/package.json"),
-    join2(dirname2(process.execPath), "../lib/node_modules/@mariozechner/pi-coding-agent/package.json")
+    join3(dirname2(process.execPath), "../lib/node_modules/@earendil-works/pi-coding-agent/package.json"),
+    join3(dirname2(process.execPath), "../lib/node_modules/@mariozechner/pi-coding-agent/package.json")
   ]) {
-    if (existsSync2(guess)) return finish(guess);
+    if (existsSync3(guess)) return finish(guess);
   }
   return finish(null);
 }
@@ -398,14 +588,14 @@ function resolveJitiCreate() {
   if (piPkg) {
     let dir = dirname2(piPkg);
     for (let i = 0; i < 6; i++) {
-      const nested = join2(dir, "node_modules", "jiti", "lib", "jiti.cjs");
-      const nestedPkg = join2(dir, "node_modules", "jiti", "package.json");
-      if (existsSync2(nestedPkg)) {
+      const nested = join3(dir, "node_modules", "jiti", "lib", "jiti.cjs");
+      const nestedPkg = join3(dir, "node_modules", "jiti", "package.json");
+      if (existsSync3(nestedPkg)) {
         try {
           const require2 = createRequire(nestedPkg);
           candidates.push(require2.resolve("jiti"));
         } catch {
-          if (existsSync2(nested)) candidates.push(nested);
+          if (existsSync3(nested)) candidates.push(nested);
         }
         break;
       }
@@ -493,7 +683,7 @@ function tryResolveFrom(fromPkgJson, spec) {
 }
 function firstExisting(...paths) {
   for (const p of paths) {
-    if (p && existsSync2(p)) return p;
+    if (p && existsSync3(p)) return p;
   }
   return null;
 }
@@ -501,9 +691,9 @@ async function buildAliases() {
   const aliases = {};
   const piPkg = resolvePiPackageJson();
   const piRoot = piPkg ? dirname2(piPkg) : null;
-  const piModuleRoots = piRoot ? [join2(piRoot, "node_modules"), dirname2(dirname2(piRoot))] : [];
+  const piModuleRoots = piRoot ? [join3(piRoot, "node_modules"), dirname2(dirname2(piRoot))] : [];
   const requireFromPi = piPkg ? createRequire(piPkg) : null;
-  const piModule = (pkg, file) => firstExisting(...piModuleRoots.map((root) => join2(root, pkg, file)));
+  const piModule = (pkg, file) => firstExisting(...piModuleRoots.map((root) => join3(root, pkg, file)));
   const set = (spec, path) => {
     if (path) aliases[spec] = path;
   };
@@ -523,7 +713,7 @@ async function buildAliases() {
   };
   const piCoding = firstExisting(
     resolveSpec("@earendil-works/pi-coding-agent"),
-    piRoot ? join2(piRoot, "dist/index.js") : null
+    piRoot ? join3(piRoot, "dist/index.js") : null
   );
   set("@earendil-works/pi-coding-agent", piCoding);
   set("@mariozechner/pi-coding-agent", piCoding);
@@ -762,183 +952,6 @@ async function loadResolvedEntry(entry, pi, ctx, deps) {
 // src/migrate.ts
 import { copyFileSync, existsSync as existsSync4, readFileSync as readFileSync4 } from "node:fs";
 import { getAgentDir as getAgentDir3 } from "@earendil-works/pi-coding-agent";
-
-// src/resolve.ts
-import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync3, statSync as statSync2 } from "node:fs";
-import { isAbsolute, join as join3, relative, resolve, sep } from "node:path";
-import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
-function isRecord2(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-function safeIsDirectory(path) {
-  try {
-    return statSync2(path).isDirectory();
-  } catch {
-    return false;
-  }
-}
-function npmPackageName(source) {
-  if (source.startsWith("npm:")) {
-    const rest = source.slice(4);
-    if (rest.startsWith("@")) {
-      const m = rest.match(/^(@[^/]+\/[^@]+)/);
-      return m?.[1] ?? rest;
-    }
-    return rest.split("@")[0] ?? rest;
-  }
-  if (!source.includes(":") && !source.startsWith(".") && !source.startsWith("/")) {
-    return source.startsWith("@") ? source.match(/^(@[^/]+\/[^@]+)/)?.[1] ?? source : source.split("@")[0];
-  }
-  return null;
-}
-function npmPackageIdentity(source) {
-  const name = npmPackageName(source);
-  if (!name) return null;
-  const rest = source.startsWith("npm:") ? source.slice(4) : source;
-  const selector = rest.slice(name.length);
-  return { name, ...selector.startsWith("@") && selector.length > 1 ? { selector: selector.slice(1) } : {} };
-}
-function resolvePackageRoot(source, agentDir = getAgentDir2(), cwd = process.cwd()) {
-  const npmName = npmPackageName(source);
-  if (npmName) {
-    const candidates = [
-      join3(agentDir, "npm", "node_modules", npmName),
-      join3(cwd, ".pi", "npm", "node_modules", npmName)
-    ];
-    for (const c of candidates) {
-      if (safeIsDirectory(c)) return c;
-    }
-    return null;
-  }
-  if (source.startsWith("git:") || source.startsWith("https://") || source.startsWith("http://") || source.startsWith("ssh://")) {
-    const gitRoot = join3(agentDir, "git");
-    if (existsSync3(gitRoot)) {
-    }
-    return null;
-  }
-  const local = resolve(cwd, source);
-  if (safeIsDirectory(local)) return local;
-  return null;
-}
-function readPiManifest(packageRoot) {
-  const pj = join3(packageRoot, "package.json");
-  if (!existsSync3(pj)) return null;
-  try {
-    const pkg = JSON.parse(readFileSync3(pj, "utf-8"));
-    if (!isRecord2(pkg) || !isRecord2(pkg.pi)) return null;
-    const extensions = Array.isArray(pkg.pi.extensions) ? pkg.pi.extensions.filter((entry) => typeof entry === "string" && entry.length > 0) : void 0;
-    return { extensions };
-  } catch {
-    return null;
-  }
-}
-function isExtensionFile(name) {
-  return name.endsWith(".ts") || name.endsWith(".js") || name.endsWith(".mts") || name.endsWith(".mjs");
-}
-function resolveExtensionEntries(packageRoot) {
-  const manifest = readPiManifest(packageRoot);
-  if (manifest?.extensions?.length) {
-    const entries = [];
-    for (const extPath of manifest.extensions) {
-      const resolved = resolve(packageRoot, extPath);
-      const withinRoot = relative(packageRoot, resolved);
-      if (withinRoot === ".." || withinRoot.startsWith(`..${sep}`) || isAbsolute(withinRoot)) continue;
-      if (!existsSync3(resolved)) continue;
-      let st;
-      try {
-        st = statSync2(resolved);
-      } catch {
-        continue;
-      }
-      if (st.isFile() && isExtensionFile(resolved)) {
-        entries.push(resolved);
-        continue;
-      }
-      if (st.isDirectory()) {
-        const indexTs2 = join3(resolved, "index.ts");
-        const indexJs2 = join3(resolved, "index.js");
-        if (existsSync3(indexTs2)) entries.push(indexTs2);
-        else if (existsSync3(indexJs2)) entries.push(indexJs2);
-        else {
-          try {
-            for (const item of readdirSync(resolved, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-              if (item.isFile() && isExtensionFile(item.name)) {
-                entries.push(join3(resolved, item.name));
-              }
-            }
-          } catch {
-          }
-        }
-      }
-    }
-    if (entries.length > 0) return entries;
-  }
-  const indexTs = join3(packageRoot, "index.ts");
-  const indexJs = join3(packageRoot, "index.js");
-  if (existsSync3(indexTs)) return [indexTs];
-  if (existsSync3(indexJs)) return [indexJs];
-  return [];
-}
-function resolveSpecPaths(spec, agentDir = getAgentDir2(), cwd = process.cwd()) {
-  const packageRoot = resolvePackageRoot(spec.source, agentDir, cwd);
-  if (!packageRoot) {
-    return { packageRoot: null, extensionPaths: [] };
-  }
-  return {
-    packageRoot,
-    extensionPaths: resolveExtensionEntries(packageRoot)
-  };
-}
-function isModuleLazyInSettings(source, settingsPackages) {
-  const matches = [];
-  for (const entry of settingsPackages) {
-    if (typeof entry === "string") {
-      if (sourcesMatch(entry, source)) matches.push(entry);
-      continue;
-    }
-    if (entry && typeof entry === "object") {
-      const obj = entry;
-      if (typeof obj.source === "string" && sourcesMatch(obj.source, source)) matches.push(entry);
-    }
-  }
-  if (matches.length !== 1) return false;
-  const match = matches[0];
-  return !!match && typeof match === "object" && Array.isArray(match.extensions) && match.extensions.length === 0;
-}
-function normalizeSourceKey(source) {
-  const trimmed = source.trim();
-  const npm = npmPackageName(trimmed);
-  if (npm) return `npm:${trimmed.startsWith("npm:") ? trimmed.slice(4) : trimmed}`;
-  return trimmed;
-}
-function sourcesMatch(left, right) {
-  const leftNpm = npmPackageIdentity(left);
-  const rightNpm = npmPackageIdentity(right);
-  if (leftNpm || rightNpm) {
-    if (!leftNpm || !rightNpm || leftNpm.name !== rightNpm.name) return false;
-    return !leftNpm.selector || !rightNpm.selector || leftNpm.selector === rightNpm.selector;
-  }
-  return normalizeSourceKey(left) === normalizeSourceKey(right);
-}
-function findSettingsPackageIndex(settingsPackages, source) {
-  return findSettingsPackageIndices(settingsPackages, source)[0] ?? -1;
-}
-function findSettingsPackageIndices(settingsPackages, source) {
-  const indices = [];
-  settingsPackages.forEach((entry, index) => {
-    if (typeof entry === "string") {
-      if (sourcesMatch(entry, source)) indices.push(index);
-      return;
-    }
-    if (entry && typeof entry === "object" && typeof entry.source === "string") {
-      if (sourcesMatch(entry.source, source)) indices.push(index);
-      return;
-    }
-  });
-  return indices;
-}
-
-// src/migrate.ts
 function packageSource(spec) {
   if (spec.source.startsWith("npm:") || spec.source.startsWith("git:") || spec.source.startsWith("http://") || spec.source.startsWith("https://") || spec.source.startsWith("ssh://") || spec.source.startsWith("/") || spec.source.startsWith(".")) {
     return spec.source;
@@ -1042,6 +1055,11 @@ function migrateSettings(agentDir = getAgentDir3()) {
 // src/index.ts
 import { performance } from "node:perf_hooks";
 import { copyFileSync as copyFileSync2, existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+var SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
+function activeSpecs(config) {
+  if (process.env[SUBAGENT_CHILD_ENV] !== "1") return config.specs;
+  return config.specs.filter((spec) => spec.loadInSubagents !== false);
+}
 var MAX_ADAPTIVE_YIELD_MS = 250;
 var PAUSE_TIMEOUT_MS = 6e4;
 function sleep(ms) {
@@ -1083,7 +1101,7 @@ function readSettingsPackages(agentDir) {
 function buildCatalog(config, agentDir) {
   const packages = readSettingsPackages(agentDir);
   const map = /* @__PURE__ */ new Map();
-  for (const spec of config.specs) {
+  for (const spec of activeSpecs(config)) {
     const managed = isManagedLazy(spec);
     const moduleLazyReady = managed && isModuleLazyInSettings(spec.source, packages);
     let state;

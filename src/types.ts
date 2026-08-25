@@ -37,6 +37,8 @@ export interface LazySpec {
 	dependencies?: string[];
 	/** Optional human description */
 	description?: string;
+	/** Whether this package's lazy stubs may load inside pi-subagent child processes. Defaults true, except pi-subagents itself. */
+	loadInSubagents?: boolean;
 }
 
 export interface LazyConfig {

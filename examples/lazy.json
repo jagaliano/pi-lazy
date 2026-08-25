@@ -35,7 +35,8 @@
       "source": "npm:pi-subagents",
       "lazy": "after-start",
       "priority": 10,
-      "description": "Subagent orchestration"
+      "loadInSubagents": false,
+      "description": "Subagent orchestration; child runtime owns its tools"
     },
     {
       "name": "todo",
