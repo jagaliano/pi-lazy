@@ -254,8 +254,7 @@ Here's a full example (also in [`examples/lazy.json`](./examples/lazy.json)):
       "source": "npm:pi-subagents",
       "lazy": "after-start",
       "priority": 10,
-      "loadInSubagents": false,
-      "description": "Load after UI is ready; child runtime owns its orchestration tools"
+      "description": "Load after UI is ready"
     },
     {
       "name": "web",
@@ -332,20 +331,20 @@ triggers so they load on first real use instead.
 | `keywords` | no | Case-insensitive prompt substrings checked on `before_agent_start` |
 | `dependencies` | no | Other **spec names** to load first |
 | `description` | no | Human-readable note (shown in your own docs; not required at runtime) |
-| `loadInSubagents` | no | Whether lazy stubs may load in `PI_SUBAGENT_CHILD=1` processes (default `true`; built-in `pi-subagents` defaults `false`) |
+| `loadInSubagents` | no | Whether this spec's lazy stubs may load in a detected child process (default `false` in children, `true` in the parent) |
 
 ### Child Pi processes
 
-`pi-subagents` (maintained by nicobailon) starts child Pi processes and injects
-runtime orchestration tools such as `subagent_wait`. Other child-process
-integrations may do the same. pi-lazy therefore does not register a package's
-lazy stubs in a child when its spec sets `loadInSubagents: false`.
+When Pi starts as a child process, pi-lazy omits lazy stubs by default. This
+prevents duplicate registration and keeps child tool surfaces intentional across
+subagent implementations. Set `loadInSubagents: true` only for packages that
+must manage their own lazy lifecycle inside children.
 
-The built-in `pi-subagents` spec is child-disabled automatically, including in
-older `lazy.json` files that omit the field. This prevents duplicate tool
-registration without disabling unrelated ambient extensions or lazy stubs for
-web, MCP, lens, and similar packages. Set `loadInSubagents: true` only when a
-child must own that package's lazy lifecycle.
+Child detection uses explicit Pi child-process markers: `PI_SUBAGENT_CHILD=1`,
+`PI_IS_SUBAGENT`, child identity/run/session markers, or the documented
+child-agent/parent-PID marker pair. Parent-session variables are not sufficient
+because a parent may inherit them; generic configuration variables such as depth
+or limits also do not trigger child mode.
 
 ### Choosing what stays eager
 
