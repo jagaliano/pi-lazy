@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-- Avoid duplicate orchestration-tool registration in Pi child processes. The built-in
-  `pi-subagents` spec now defaults to `loadInSubagents: false`, while pi-lazy keeps
-  unrelated lazy stubs available to children. This addresses the integration with
-  nicobailon's `pi-subagents` package and similar child-runtime extensions without
-  requiring a destructive `extensions: []` child allowlist.
+- Avoid duplicate extension-tool registration in Pi child processes. Lazy stubs
+  are now omitted from detected child processes by default for every spec;
+  individual specs can opt in with `loadInSubagents: true`. This applies across
+  compatible subagent implementations without requiring a destructive
+  `extensions: []` child allowlist.
 
 ## 0.3.0
 

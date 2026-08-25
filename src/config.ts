@@ -12,7 +12,6 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { npmPackageName } from "./resolve.ts";
 import type { LazyConfig, LazyMode, LazySpec } from "./types.ts";
 
 export const CONFIG_VERSION = 1 as const;
@@ -57,7 +56,6 @@ export function defaultConfig(): LazyConfig {
 				source: "npm:pi-subagents",
 				lazy: "after-start",
 				priority: 10,
-				loadInSubagents: false,
 				description: "Subagent orchestration",
 			},
 			{
@@ -215,12 +213,7 @@ function normalizeSpec(value: unknown, index: number, defaultsLazy: LazyMode, is
 			loadInSubagents = value.loadInSubagents;
 		} else {
 			issues.push(`${field}.loadInSubagents must be a boolean`);
-			if (npmPackageName(source) === "pi-subagents") loadInSubagents = false;
 		}
-	} else if (npmPackageName(source) === "pi-subagents") {
-		// pi-subagents injects its own child runtime tools. Do not let pi-lazy
-		// register duplicate stubs in children, including older lazy.json files.
-		loadInSubagents = false;
 	}
 
 	return {

@@ -11,6 +11,10 @@ import { isModuleLazyInSettings, resolveExtensionEntries } from "../src/resolve.
 import type { LazySpec, LoadResult, ResolvedEntry } from "../src/types.ts";
 
 const tempRoots: string[] = [];
+const inheritedChildMarkers = Object.fromEntries(
+	Object.entries(process.env).filter(([key]) => key === "PI_IS_SUBAGENT" || /SUBAGENT/.test(key)),
+);
+for (const key of Object.keys(inheritedChildMarkers)) delete process.env[key];
 
 function tempDir(prefix = "pi-lazy-test-"): string {
 	const path = mkdtempSync(join(tmpdir(), prefix));
@@ -20,6 +24,7 @@ function tempDir(prefix = "pi-lazy-test-"): string {
 
 test.after(() => {
 	for (const path of tempRoots) rmSync(path, { recursive: true, force: true });
+	Object.assign(process.env, inheritedChildMarkers);
 });
 
 function writeJson(path: string, value: unknown) {
@@ -115,74 +120,74 @@ test("config validation retains valid specs and rejects duplicate names", () => 
 	assert.ok(errors.some((message) => /duplicate spec name/.test(message)));
 });
 
-test("subagent children omit pi-subagents stubs while preserving other lazy stubs", () => {
+test("child processes omit lazy stubs unless specs opt in", () => {
 	const agent = tempDir();
 	writeJson(join(agent, "lazy.json"), {
 		version: 1,
 		specs: [
-			{ name: "orchestrator", source: "npm:pi-subagents", lazy: true, tools: ["subagent_wait"] },
-			{ name: "forced", source: "npm:pi-subagents", lazy: true, loadInSubagents: true, tools: ["forced_wait"] },
-			{ name: "invalid", source: "npm:pi-subagents", lazy: true, loadInSubagents: "false", tools: ["invalid_wait"] },
-			{ name: "subagents", source: "npm:custom-subagents", lazy: true, tools: ["custom_wait"] },
-			{ name: "disabled-custom", source: "npm:custom-subagents", lazy: true, loadInSubagents: false, tools: ["disabled_custom_wait"] },
-			{ name: "web", source: "npm:pi-web-access", lazy: true, tools: ["web_search"] },
-			{ name: "mcp", source: "npm:pi-mcp-adapter", lazy: true, tools: ["mcp_proxy"] },
+			{ name: "default", source: "npm:example-default", lazy: true, tools: ["default_tool"] },
+			{ name: "enabled", source: "npm:example-enabled", lazy: true, loadInSubagents: true, tools: ["enabled_tool"] },
+			{ name: "disabled", source: "npm:example-disabled", lazy: true, loadInSubagents: false, tools: ["disabled_tool"] },
+			{ name: "invalid", source: "npm:example-invalid", lazy: true, loadInSubagents: "false", tools: ["invalid_tool"] },
 		],
 	});
 	writeJson(join(agent, "settings.json"), {
 		packages: [
-			{ source: "npm:pi-subagents", extensions: [] },
-			{ source: "npm:custom-subagents", extensions: [] },
-			{ source: "npm:pi-web-access", extensions: [] },
-			{ source: "npm:pi-mcp-adapter", extensions: [] },
+			{ source: "npm:example-default", extensions: [] },
+			{ source: "npm:example-enabled", extensions: [] },
+			{ source: "npm:example-disabled", extensions: [] },
+			{ source: "npm:example-invalid", extensions: [] },
 		],
 	});
-	const previousChildFlag = process.env.PI_SUBAGENT_CHILD;
+	const previousEnv = { ...process.env };
 	try {
+		for (const key of Object.keys(process.env)) {
+			if (key === "PI_IS_SUBAGENT" || /SUBAGENT/.test(key)) delete process.env[key];
+		}
 		process.env.PI_SUBAGENT_CHILD = "1";
 		const child = mockPi();
 		createPiLazy(child.api, agent);
-		assert.equal(child.tools.has("subagent_wait"), false);
-		assert.equal(child.tools.has("forced_wait"), true);
-		assert.equal(child.tools.has("invalid_wait"), false);
-		assert.equal(child.tools.has("custom_wait"), true);
-		assert.equal(child.tools.has("disabled_custom_wait"), false);
-		assert.equal(child.tools.has("web_search"), true);
-		assert.equal(child.tools.has("mcp_proxy"), true);
+		assert.equal(child.tools.has("default_tool"), false);
+		assert.equal(child.tools.has("enabled_tool"), true);
+		assert.equal(child.tools.has("disabled_tool"), false);
+		assert.equal(child.tools.has("invalid_tool"), false);
 	} finally {
-		if (previousChildFlag === undefined) delete process.env.PI_SUBAGENT_CHILD;
-		else process.env.PI_SUBAGENT_CHILD = previousChildFlag;
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, previousEnv);
 	}
 
+	process.env.PI_SUBAGENT_DEPTH = "3";
+	process.env.PI_SUBAGENT_PARENT_SESSION = "parent-session";
 	const parent = mockPi();
 	createPiLazy(parent.api, agent);
-	assert.equal(parent.tools.has("subagent_wait"), true);
-	assert.equal(parent.tools.has("forced_wait"), true);
-	assert.equal(parent.tools.has("invalid_wait"), true);
-	assert.equal(parent.tools.has("custom_wait"), true);
-	assert.equal(parent.tools.has("disabled_custom_wait"), true);
-	assert.equal(parent.tools.has("web_search"), true);
-	assert.equal(parent.tools.has("mcp_proxy"), true);
+	delete process.env.PI_SUBAGENT_DEPTH;
+	assert.equal(parent.tools.has("default_tool"), true);
+	assert.equal(parent.tools.has("enabled_tool"), true);
+	assert.equal(parent.tools.has("disabled_tool"), true);
+	assert.equal(parent.tools.has("invalid_tool"), true);
 });
 
-test("pi-subagents identity defaults across source forms", () => {
+test("generic child markers disable lazy stubs", () => {
 	const agent = tempDir();
 	writeJson(join(agent, "lazy.json"), {
 		version: 1,
-		specs: [
-			{ name: "exact", source: "npm:pi-subagents", lazy: true },
-			{ name: "pinned", source: "npm:pi-subagents@1.2.3", lazy: true },
-			{ name: "bare", source: "pi-subagents", lazy: true },
-			{ name: "invalid", source: "npm:pi-subagents", lazy: true, loadInSubagents: "false" },
-			{ name: "custom", source: "npm:custom-subagents", lazy: true },
-		],
+		specs: [{ name: "pkg", source: "npm:example", lazy: true, tools: ["example_tool"] }],
 	});
-	const specs = loadConfig(agent).specs;
-	assert.equal(specs.find((spec) => spec.name === "exact")?.loadInSubagents, false);
-	assert.equal(specs.find((spec) => spec.name === "pinned")?.loadInSubagents, false);
-	assert.equal(specs.find((spec) => spec.name === "bare")?.loadInSubagents, false);
-	assert.equal(specs.find((spec) => spec.name === "invalid")?.loadInSubagents, false);
-	assert.equal(specs.find((spec) => spec.name === "custom")?.loadInSubagents, undefined);
+	writeJson(join(agent, "settings.json"), { packages: [{ source: "npm:example", extensions: [] }] });
+	const markers = ["PI_IS_SUBAGENT", "PI_SUBAGENT_CHILD", "PI_SUBAGENT_NAME", "PI_AGENT_ROUTER_SUBAGENT"];
+	const previousEnv = { ...process.env };
+	try {
+		for (const marker of markers) {
+			for (const key of Object.keys(process.env)) delete process.env[key];
+			process.env[marker] = "1";
+			const child = mockPi();
+			createPiLazy(child.api, agent);
+			assert.equal(child.tools.has("example_tool"), false, marker);
+		}
+	} finally {
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, previousEnv);
+	}
 });
 
 test("migration restores eager extensions without losing package metadata", () => {
