@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Avoid duplicate orchestration-tool registration in Pi child processes. The built-in
+  `pi-subagents` spec now defaults to `loadInSubagents: false`, while pi-lazy keeps
+  unrelated lazy stubs available to children. This addresses the integration with
+  nicobailon's `pi-subagents` package and similar child-runtime extensions without
+  requiring a destructive `extensions: []` child allowlist.
+
 ## 0.3.0
 
 Startup responsiveness. The after-start queue previously began on a

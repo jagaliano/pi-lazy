@@ -24,6 +24,13 @@ import { migrateSettings } from "./migrate.ts";
 import { isModuleLazyInSettings, resolveSpecPaths } from "./resolve.ts";
 import { performance } from "node:perf_hooks";
 import type { LazyConfig, LoadResult, ResolvedEntry } from "./types.ts";
+
+const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
+
+function activeSpecs(config: LazyConfig) {
+	if (process.env[SUBAGENT_CHILD_ENV] !== "1") return config.specs;
+	return config.specs.filter((spec) => spec.loadInSubagents !== false);
+}
 import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { getSettingsPath } from "./config.ts";
 
@@ -101,7 +108,7 @@ function buildCatalog(config: LazyConfig, agentDir: string): Map<string, Resolve
 	const packages = readSettingsPackages(agentDir);
 	const map = new Map<string, ResolvedEntry>();
 
-	for (const spec of config.specs) {
+	for (const spec of activeSpecs(config)) {
 		const managed = isManagedLazy(spec);
 		const moduleLazyReady = managed && isModuleLazyInSettings(spec.source, packages);
 
